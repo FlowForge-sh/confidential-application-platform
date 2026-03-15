@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-base
+  labels:
+    tenant: tenant-base
+    tenant-id: "000"
+    isolation: strict
+    managed-by: kustomize
+    pod-security.kubernetes.io/enforce: baseline

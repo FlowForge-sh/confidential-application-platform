@@ -1,0 +1,28 @@
+# Tenant isolation: ingress from same namespace only; egress to DNS and same namespace.
+# KBS and world 80/443 are added by tenant-contract component.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: tenant-isolation
+  namespace: tenant-base
+spec:
+  description: "Strict network isolation for multi-tenant security"
+  endpointSelector: {}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: tenant-base
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: tenant-base

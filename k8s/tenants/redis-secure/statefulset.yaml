@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        app.kubernetes.io/name: redis
+      annotations:
+        io.containerd.cri.runtime-handler: kata-qemu-snp
+        io.katacontainers.config.hypervisor.kernel_params: "agent.aa_kbc_params=cc_kbc::http://kbs-service.trustee-operator-system.svc.cluster.local:8080 agent.guest_components_rest_api=all"
+        io.katacontainers.config.hypervisor.cc_init_data: "H4sIAAAAAAAC/72SsY7bMAyGdz2FoSVLrdhx4ksMHNBDgQKdWnQNAoOiGVu1LLmSnMM1yLtXaq5DDx2LDhpI/QQ/8ueFnFfWZI8ZL0QpCs5A99apMEwp5wfY7GrO2LGDACfGZ6sVvghHveVRsFqt2Aw4Qk9ZfCa0dwFjHZ1h0SF70to+f6XvC/ngP4LSyvRffmmy5jELbiHG7jVtapGSV47WBFAmsvHmeOWfP3zizZU/GWMDhIjrU6isGBdJzlAgL9ApoabIkBuYiDe8H9AJZdegv8EPJLeszRL8QFrngej9fbKm3KLsColQyQo223pTbcuqOtddedhAJ8u6OOyKupKHXVU/HAqSkqpC7vdYIjycS+Dv3nDMthOJwMe1JAxHnfJ5R5P9q9STuyikHBDtYoJ4hb9XPVs3agsdv91ibRqu/b/D3U43lixmHEAEO+nfnh+DHcm00aez6v3pTSxGGXOL0+mEhhDmZr2Oqfx1WBFd9xEztzM5CNbl/iXGk/AXFKjTnxPaIuhmX+zjSd4RsBv+ZBglnlhaSGqD2MaY/+OuPwFYQx4XHwMAAA=="
+        io.katacontainers.config.runtime.cc_init_data: "H4sIAAAAAAAC/72SsY7bMAyGdz2FoSVLrdhx4ksMHNBDgQKdWnQNAoOiGVu1LLmSnMM1yLtXaq5DDx2LDhpI/QQ/8ueFnFfWZI8ZL0QpCs5A99apMEwp5wfY7GrO2LGDACfGZ6sVvghHveVRsFqt2Aw4Qk9ZfCa0dwFjHZ1h0SF70to+f6XvC/ngP4LSyvRffmmy5jELbiHG7jVtapGSV47WBFAmsvHmeOWfP3zizZU/GWMDhIjrU6isGBdJzlAgL9ApoabIkBuYiDe8H9AJZdegv8EPJLeszRL8QFrngej9fbKm3KLsColQyQo223pTbcuqOtddedhAJ8u6OOyKupKHXVU/HAqSkqpC7vdYIjycS+Dv3nDMthOJwMe1JAxHnfJ5R5P9q9STuyikHBDtYoJ4hb9XPVs3agsdv91ibRqu/b/D3U43lixmHEAEO+nfnh+DHcm00aez6v3pTSxGGXOL0+mEhhDmZr2Oqfx1WBFd9xEztzM5CNbl/iXGk/AXFKjTnxPaIuhmX+zjSd4RsBv+ZBglnlhaSGqD2MaY/+OuPwFYQx4XHwMAAA=="
+        storage.flowforge.sh/secure-pv-init-data-sha256: "cd3438a42fcfae5a8af41052e62df1578823e78b57110f44371f96747b7ce9b5"
+    spec:
+      runtimeClassName: kata-qemu-snp
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      nodeSelector:
+        katacontainers.io/kata-runtime: "true"
+        node.kubernetes.io/worker: "true"
+      containers:
+        - name: redis
+          image: ghcr.io/aljazceru/nutshell-tee@sha256:14cbd0bca3b3a246234133f6d192adb16095063b9536790ebbe30b88c1ca7f1a
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - /secure-pv/bootstrap.sh
+            - --
+            - /bin/sh
+            - -ec
+            - exec redis-server --appendonly yes --dir /data --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: CRYPTSETUP_DEVICE
+              value: /dev/csi0
+            - name: VOLUME_MOUNT_POINT
+              value: /data
+            - name: SECURE_PV_ALLOW_RUNTIME_INSTALL
+              value: "false"
+            - name: SECURE_PV_STRIP_RUNTIME_CAPS
+              value: "true"
+            - name: SECURE_PV_LUKS_INTEGRITY
+              value: hmac-sha256
+            - name: SECURE_PV_EXEC_AS
+              value: redis
+            - name: WORKLOAD_SECRET_SOURCE
+              value: kbs
+            - name: WORKLOAD_SECRET_PATH
+              value: /run/secure-pv/workload-secret-seed
+            - name: KBS_RESOURCE_PATH
+              value: default/redis-demo-storage/workload-secret-seed
+            - name: KBS_CDH_ENDPOINT
+              value: http://127.0.0.1:8006/cdh/resource
+            - name: LUKS_MAPPING_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FLOWFORGE_SECURE_PV_BOOTSTRAP
+              value: "1"
+          envFrom:
+            - secretRef:
+                name: redis-env
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeDevices:
+            - name: state
+              devicePath: /dev/csi0
+          volumeMounts:
+            - name: secure-pv-bootstrap
+              mountPath: /secure-pv
+              readOnly: true
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_ADMIN"]
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: secure-pv-bootstrap
+          configMap:
+            name: secure-pv-bootstrap-script
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes:
+          - ReadWriteOncePod
+        volumeMode: Block
+        storageClassName: longhorn-wait
+        resources:
+          requests:
+            storage: 10Gi

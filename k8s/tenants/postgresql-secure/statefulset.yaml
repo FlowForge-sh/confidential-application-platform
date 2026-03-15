@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+spec:
+  serviceName: postgresql
+  replicas: 1
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+        app.kubernetes.io/name: postgresql
+      annotations:
+        io.containerd.cri.runtime-handler: kata-qemu-snp
+        io.katacontainers.config.hypervisor.kernel_params: "agent.aa_kbc_params=cc_kbc::http://kbs-service.trustee-operator-system.svc.cluster.local:8080 agent.guest_components_rest_api=all"
+        io.katacontainers.config.hypervisor.cc_init_data: "H4sIAAAAAAAC/72SwYrbMBCG73oKo0sutWJnG8c2LHQpFHpq6TUEM5bHtmpZ45XkLNuQd6/U7EK79Fh60OEfzWi+f0ZntE6RSe4TnolcZJyBHsgqP84x5kbY7QvO2LEDDyfGF9JKPguLA/GQsNls2AJyggGTcIxvbgmMddjDqn3yoDU9fcPHFZ13n0BpZYavv3KS+j7xdkXGbjVNbBGDFy7JeFAmsPH6eOFfPn7m9YU/GEMefMB1USoS09qiNejRCWmVUHNgSA3MyGs+jNIKRVvQ3+GHRLtuzerdiFqnHvHDzVldAWZtX8Ghq+7avIOdLEAe+mrfQlHd7du2yKCq2jzfl9WuLHrIs+J92fVt2Wd4kDv+7g3HQp2IBC6MJWIs5Pxg0T3qtMOZ/prv0J6VxBSkpNV48eLgt9InspMm6Pj1Gh6INpv/a/N6urK4bMYBhKdZv27/6GlC04SN9WpwpzdaTG2IrVbHzzR6v9TbbQilL45F2L8LmCktaMGTTd1z0LNwZymkjndWaJKg6zIrw+e8Ichu/JNhauWJxYHENlI2QfN/3PUn6rMlHCkDAAA="
+        io.katacontainers.config.runtime.cc_init_data: "H4sIAAAAAAAC/72SwYrbMBCG73oKo0sutWJnG8c2LHQpFHpq6TUEM5bHtmpZ45XkLNuQd6/U7EK79Fh60OEfzWi+f0ZntE6RSe4TnolcZJyBHsgqP84x5kbY7QvO2LEDDyfGF9JKPguLA/GQsNls2AJyggGTcIxvbgmMddjDqn3yoDU9fcPHFZ13n0BpZYavv3KS+j7xdkXGbjVNbBGDFy7JeFAmsPH6eOFfPn7m9YU/GEMefMB1USoS09qiNejRCWmVUHNgSA3MyGs+jNIKRVvQ3+GHRLtuzerdiFqnHvHDzVldAWZtX8Ghq+7avIOdLEAe+mrfQlHd7du2yKCq2jzfl9WuLHrIs+J92fVt2Wd4kDv+7g3HQp2IBC6MJWIs5Pxg0T3qtMOZ/prv0J6VxBSkpNV48eLgt9InspMm6Pj1Gh6INpv/a/N6urK4bMYBhKdZv27/6GlC04SN9WpwpzdaTG2IrVbHzzR6v9TbbQilL45F2L8LmCktaMGTTd1z0LNwZymkjndWaJKg6zIrw+e8Ichu/JNhauWJxYHENlI2QfN/3PUn6rMlHCkDAAA="
+        storage.flowforge.sh/secure-pv-init-data-sha256: "2c48bfcbbacea1799c15c340476cedbc1365290734f6281083298b87cc03554c"
+    spec:
+      runtimeClassName: kata-qemu-snp
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      nodeSelector:
+        katacontainers.io/kata-runtime: "true"
+        node.kubernetes.io/worker: "true"
+      containers:
+        - name: postgresql
+          image: ghcr.io/aljazceru/nutshell-tee@sha256:9ae0bf9a7d93b1da2c6ac7f95ba6935bb60a99b11589286fa10648dfb8f0e7c2
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - /secure-pv/bootstrap.sh
+            - --
+            - /bin/bash
+            - -ec
+            - exec /usr/local/bin/docker-entrypoint.sh postgres
+          env:
+            - name: CRYPTSETUP_DEVICE
+              value: /dev/csi0
+            - name: VOLUME_MOUNT_POINT
+              value: /var/lib/postgresql/data
+            - name: SECURE_PV_ALLOW_RUNTIME_INSTALL
+              value: "false"
+            - name: SECURE_PV_STRIP_RUNTIME_CAPS
+              value: "true"
+            - name: SECURE_PV_LUKS_INTEGRITY
+              value: hmac-sha256
+            - name: SECURE_PV_EXEC_AS
+              value: postgres
+            - name: WORKLOAD_SECRET_SOURCE
+              value: kbs
+            - name: WORKLOAD_SECRET_PATH
+              value: /run/secure-pv/workload-secret-seed
+            - name: KBS_RESOURCE_PATH
+              value: default/postgresql-demo-storage/workload-secret-seed
+            - name: KBS_CDH_ENDPOINT
+              value: http://127.0.0.1:8006/cdh/resource
+            - name: LUKS_MAPPING_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FLOWFORGE_SECURE_PV_BOOTSTRAP
+              value: "1"
+          envFrom:
+            - secretRef:
+                name: postgresql-env
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeDevices:
+            - name: state
+              devicePath: /dev/csi0
+          volumeMounts:
+            - name: secure-pv-bootstrap
+              mountPath: /secure-pv
+              readOnly: true
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_ADMIN"]
+          startupProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: secure-pv-bootstrap
+          configMap:
+            name: secure-pv-bootstrap-script
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes:
+          - ReadWriteOncePod
+        volumeMode: Block
+        storageClassName: longhorn-wait
+        resources:
+          requests:
+            storage: 10Gi

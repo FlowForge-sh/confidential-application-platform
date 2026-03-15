@@ -1,0 +1,58 @@
+---
+# Variables for worker nodes
+
+# Server URL for joining cluster (primary master; set at runtime from inventory)
+k3s_server_url: "https://{{ hostvars[groups['masters'][0]]['private_ip'] | default(hostvars[groups['masters'][0]]['ansible_host']) }}:6443"
+# k3s_cluster_token is set by the playbook after fetching from primary master
+
+# K3s agent configuration
+k3s_agent_config:
+  node-label:
+    - "node.kubernetes.io/worker=true"
+    - "kata.enabled=true"
+  kubelet-arg:
+    - "protect-kernel-defaults=true"
+    - "streaming-connection-idle-timeout=5m"
+    - "container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+
+install_kata: true
+kata_config:
+  hypervisor: "{{ kata_hypervisor | default('qemu') }}"
+  default_vcpus: 1
+  default_maxvcpus: 4
+  default_memory: 2048
+  enable_debug: false
+  enable_tracing: false
+  kernel_params: "systemd.unified_cgroup_hierarchy=0"
+
+containerd_kata_config:
+  version: 2
+  plugins:
+    "io.containerd.grpc.v1.cri":
+      containerd:
+        default_runtime_name: "kata-qemu"
+        runtimes:
+          kata-qemu:
+            runtime_type: "io.containerd.kata-qemu.v2"
+            privileged_without_host_devices: false
+            pod_annotations:
+              - "io.katacontainers.*"
+          runc:
+            runtime_type: "io.containerd.runc.v2"
+            privileged_without_host_devices: false
+
+coco_enabled: "{{ enable_confidential_containers | default(false) }}"
+coco_config:
+  attestation_agent_enabled: true
+  image_encryption_enabled: false
+
+worker_kernel_modules:
+  - kvm
+  - kvm_intel
+  - kvm_amd
+  - vhost
+  - vhost_net
+  - vhost_vsock
+
+verify_kvm_support: true
+verify_nested_virtualization: false

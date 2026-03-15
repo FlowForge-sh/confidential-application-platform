@@ -1,0 +1,205 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - target:
+      kind: Namespace
+      name: tenant-base
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: tenant-base
+      - op: add
+        path: /metadata/labels/client
+        value: tenant-base
+
+  - target:
+      kind: CiliumNetworkPolicy
+      name: tenant-isolation
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/fromEndpoints/0/matchLabels/io.kubernetes.pod.namespace
+        value: tenant-base
+      - op: replace
+        path: /spec/egress
+        value:
+          - toEndpoints:
+              - matchLabels:
+                  io.kubernetes.pod.namespace: kube-system
+                  k8s-app: kube-dns
+            toPorts:
+              - ports:
+                  - port: "53"
+                    protocol: UDP
+                  - port: "53"
+                    protocol: TCP
+          - toEndpoints:
+              - matchLabels:
+                  io.kubernetes.pod.namespace: tenant-base
+          - toServices:
+              - k8sService:
+                  namespace: trustee-operator-system
+                  serviceName: kbs-service
+            toPorts:
+              - ports:
+                  - port: "8080"
+                    protocol: TCP
+                rules:
+                  http:
+                    - path: "^/kbs/v0/auth.*$"
+                    - path: "^/kbs/v0/attest.*$"
+                    - path: "^/kbs/v0/resource/default/kbsres1/key1.*$"
+          - toEntities:
+              - world
+            toPorts:
+              - ports:
+                  - port: "80"
+                    protocol: TCP
+                  - port: "443"
+                    protocol: TCP
+
+  - target:
+      kind: ResourceQuota
+      name: tenant-quota
+    patch: |-
+      - op: replace
+        path: /spec/hard/requests.cpu
+        value: "4"
+      - op: replace
+        path: /spec/hard/limits.cpu
+        value: "8"
+      - op: replace
+        path: /spec/hard/requests.memory
+        value: "8Gi"
+      - op: replace
+        path: /spec/hard/limits.memory
+        value: "16Gi"
+      - op: replace
+        path: /spec/hard/pods
+        value: "20"
+      - op: replace
+        path: /spec/hard/requests.storage
+        value: "50Gi"
+      - op: replace
+        path: /spec/hard/persistentvolumeclaims
+        value: "5"
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.namespace
+    targets:
+      - select:
+          kind: Namespace
+          name: tenant-base
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.tenant
+      - select:
+          kind: CiliumNetworkPolicy
+          name: tenant-isolation
+        fieldPaths:
+          - spec.ingress.0.fromEndpoints.0.matchLabels.[io.kubernetes.pod.namespace]
+          - spec.egress.1.toEndpoints.0.matchLabels.[io.kubernetes.pod.namespace]
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.client
+    targets:
+      - select:
+          kind: Namespace
+          name: tenant-base
+        fieldPaths:
+          - metadata.labels.client
+        options:
+          create: true
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.kbs_resource_regex
+    targets:
+      - select:
+          kind: CiliumNetworkPolicy
+          name: tenant-isolation
+        fieldPaths:
+          - spec.egress.2.toPorts.0.rules.http.2.path
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_requests_cpu
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.[requests.cpu]
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_limits_cpu
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.[limits.cpu]
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_requests_memory
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.[requests.memory]
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_limits_memory
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.[limits.memory]
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_pods
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.pods
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_requests_storage
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.[requests.storage]
+
+  - source:
+      kind: ConfigMap
+      name: tenant-contract
+      fieldPath: data.quota_persistentvolumeclaims
+    targets:
+      - select:
+          kind: ResourceQuota
+          name: tenant-quota
+        fieldPaths:
+          - spec.hard.persistentvolumeclaims

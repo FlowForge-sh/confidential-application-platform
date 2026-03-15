@@ -1,0 +1,353 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secure-pv-bootstrap-script
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    set -eu
+
+    if [ "${1:-}" = "--" ]; then
+      shift
+    fi
+
+    if [ "$#" -eq 0 ]; then
+      echo "secure-pv: no application command provided" >&2
+      exit 1
+    fi
+
+    is_uint() {
+      case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+    }
+
+    ensure_secure_pv_tools() {
+      if command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1; then
+        return 0
+      fi
+
+      if [ "${SECURE_PV_ALLOW_RUNTIME_INSTALL:-false}" = "true" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq cryptsetup e2fsprogs >/dev/null
+          command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1
+          return $?
+        elif command -v apk >/dev/null 2>&1; then
+          apk add --no-cache cryptsetup e2fsprogs >/dev/null
+          command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1
+          return $?
+        elif command -v dnf >/dev/null 2>&1; then
+          dnf install -y cryptsetup e2fsprogs >/dev/null
+          command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1
+          return $?
+        fi
+      fi
+
+      echo "secure-pv: required tools missing (cryptsetup, mkfs.ext4). Build them into the image." >&2
+      return 1
+    }
+
+    ensure_kbs_fetch_tool() {
+      if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+        return 0
+      fi
+
+      if [ "${SECURE_PV_ALLOW_RUNTIME_INSTALL:-false}" = "true" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq curl wget >/dev/null
+          command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+          return $?
+        elif command -v apk >/dev/null 2>&1; then
+          apk add --no-cache curl wget >/dev/null
+          command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+          return $?
+        elif command -v dnf >/dev/null 2>&1; then
+          dnf install -y curl wget >/dev/null
+          command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+          return $?
+        fi
+      fi
+
+      echo "secure-pv: required KBS fetch tool missing (curl, wget, or python). Build one into the image." >&2
+      return 1
+    }
+
+    fetch_kbs_workload_key() {
+      BASE="${KBS_CDH_ENDPOINT:-http://127.0.0.1:8006/cdh/resource}"
+      RES="${KBS_RESOURCE_PATH:-}"
+      OUT="${WORKLOAD_SECRET_PATH:-/run/secure-pv/workload-secret-seed}"
+      RETRIES="${KBS_FETCH_RETRIES:-30}"
+
+      if [ -z "$RES" ]; then
+        echo "secure-pv: KBS resource path is empty (set KBS_RESOURCE_PATH)" >&2
+        return 1
+      fi
+
+      ensure_kbs_fetch_tool
+      mkdir -p "$(dirname "$OUT")"
+      URL="${BASE%/}/${RES}"
+
+      attempt=1
+      while [ "$attempt" -le "$RETRIES" ]; do
+        if command -v curl >/dev/null 2>&1; then
+          HTTP_CODE="$(curl -sS -o "$OUT" -w "%{http_code}" "$URL" || true)"
+          if [ "$HTTP_CODE" = "200" ] && [ -s "$OUT" ]; then
+            chmod 0400 "$OUT"
+            echo "$OUT"
+            return 0
+          fi
+        elif command -v wget >/dev/null 2>&1; then
+          if wget -q -O "$OUT" "$URL" && [ -s "$OUT" ]; then
+            chmod 0400 "$OUT"
+            echo "$OUT"
+            return 0
+          fi
+        elif command -v python3 >/dev/null 2>&1; then
+          if python3 - "$URL" "$OUT" <<'PY'
+    import sys
+    import urllib.request
+
+    url = sys.argv[1]
+    out = sys.argv[2]
+    try:
+      with urllib.request.urlopen(url, timeout=10) as resp:
+        if getattr(resp, "status", None) != 200:
+          raise RuntimeError("non-200 response")
+        data = resp.read()
+      if not data:
+        raise RuntimeError("empty response")
+      with open(out, "wb") as f:
+        f.write(data)
+    except Exception:
+      raise SystemExit(1)
+    raise SystemExit(0)
+    PY
+          then
+            chmod 0400 "$OUT"
+            echo "$OUT"
+            return 0
+          fi
+        elif command -v python >/dev/null 2>&1; then
+          if python - "$URL" "$OUT" <<'PY'
+    import sys
+    import urllib.request
+
+    url = sys.argv[1]
+    out = sys.argv[2]
+    try:
+      with urllib.request.urlopen(url, timeout=10) as resp:
+        if getattr(resp, "status", None) != 200:
+          raise RuntimeError("non-200 response")
+        data = resp.read()
+      if not data:
+        raise RuntimeError("empty response")
+      with open(out, "wb") as f:
+        f.write(data)
+    except Exception:
+      raise SystemExit(1)
+    raise SystemExit(0)
+    PY
+          then
+            chmod 0400 "$OUT"
+            echo "$OUT"
+            return 0
+          fi
+        fi
+
+        sleep 1
+        attempt=$((attempt + 1))
+      done
+
+      echo "secure-pv: failed to fetch workload key from KBS after $RETRIES attempts: $URL" >&2
+      return 1
+    }
+
+    resolve_workload_key_path() {
+      SOURCE="${WORKLOAD_SECRET_SOURCE:-secret}"
+      case "$SOURCE" in
+        secret)
+          echo "${WORKLOAD_SECRET_PATH:-/enclave/secrets/workload-secret-seed}"
+          return 0
+          ;;
+        kbs)
+          fetch_kbs_workload_key
+          return $?
+          ;;
+        *)
+          echo "secure-pv: unsupported workload key source: $SOURCE" >&2
+          return 1
+          ;;
+      esac
+    }
+
+    secure_pv_bootstrap() {
+      DEV="${CRYPTSETUP_DEVICE:-/dev/csi0}"
+      MNT="${VOLUME_MOUNT_POINT:-/app/data}"
+      KEY="$(resolve_workload_key_path)"
+      MAP="${LUKS_MAPPING_NAME:-secure-pv}"
+      LUKS_INTEGRITY="${SECURE_PV_LUKS_INTEGRITY:-hmac-sha256}"
+
+      if [ ! -b "$DEV" ]; then
+        echo "secure-pv: block device missing: $DEV" >&2
+        return 1
+      fi
+      if [ -z "$KEY" ] || [ ! -f "$KEY" ]; then
+        echo "secure-pv: workload key missing: $KEY" >&2
+        return 1
+      fi
+
+      ensure_secure_pv_tools
+
+      if cryptsetup status "$MAP" >/dev/null 2>&1; then
+        cryptsetup luksClose "$MAP" || true
+      fi
+
+      if ! cryptsetup isLuks "$DEV" >/dev/null 2>&1; then
+        cryptsetup luksFormat "$DEV" "$KEY" --batch-mode --type luks2 --integrity "$LUKS_INTEGRITY"
+      fi
+
+      cryptsetup luksOpen "$DEV" "$MAP" --key-file "$KEY"
+
+      if [ "${WORKLOAD_SECRET_SOURCE:-secret}" = "kbs" ] && [ -f "$KEY" ]; then
+        chmod 000 "$KEY" || true
+        if command -v shred >/dev/null 2>&1; then
+          shred -u "$KEY" 2>/dev/null || rm -f "$KEY" || true
+        else
+          rm -f "$KEY" || true
+        fi
+      elif [ "${WORKLOAD_SECRET_SOURCE:-secret}" = "secret" ] && [ -f "$KEY" ]; then
+        chmod 000 "$KEY" || true
+        umount /enclave/secrets 2>/dev/null || true
+      fi
+
+      TYPE_LINE="$(blkid "/dev/mapper/$MAP" 2>/dev/null || true)"
+      if ! printf '%s' "$TYPE_LINE" | grep -q 'TYPE="ext4"'; then
+        mkfs.ext4 -F "/dev/mapper/$MAP"
+      fi
+
+      mkdir -p "$MNT"
+      if mountpoint -q "$MNT" 2>/dev/null; then
+        umount "$MNT" || true
+      fi
+      mount "/dev/mapper/$MAP" "$MNT"
+
+      BIND_SPECS="${SECURE_PV_BIND_MOUNTS:-}"
+      if [ -n "$BIND_SPECS" ]; then
+        OLD_IFS="$IFS"
+        IFS=','
+        for spec in $BIND_SPECS; do
+          IFS="$OLD_IFS"
+          SRC="${spec%%:*}"
+          DST="${spec#*:}"
+          if [ -z "$SRC" ] || [ -z "$DST" ] || [ "$SRC" = "$DST" ]; then
+            IFS=','
+            continue
+          fi
+          mkdir -p "$SRC" "$DST"
+          if mountpoint -q "$DST" 2>/dev/null; then
+            umount "$DST" || true
+          fi
+          mount --bind "$SRC" "$DST"
+          IFS=','
+        done
+        IFS="$OLD_IFS"
+      fi
+
+      SENTINEL="${MNT%/}/.persist-sentinel"
+      if [ ! -f "$SENTINEL" ]; then
+        date -u > "$SENTINEL"
+        sync
+      fi
+
+      TEST_FILE="${MNT%/}/.secure-pv-write-test.$$"
+      echo "secure-pv write test $(date -u)" > "$TEST_FILE"
+      sync
+      rm -f "$TEST_FILE"
+      sync
+    }
+
+    resolve_exec_identity() {
+      TARGET="$1"
+      SECURE_PV_EXEC_IDENTITY_KIND="named"
+      if id "$TARGET" >/dev/null 2>&1; then
+        SECURE_PV_EXEC_UID="$(id -u "$TARGET")"
+        SECURE_PV_EXEC_GID="$(id -g "$TARGET")"
+        export SECURE_PV_EXEC_UID SECURE_PV_EXEC_GID SECURE_PV_EXEC_IDENTITY_KIND
+        return 0
+      fi
+
+      if [ "${TARGET#*:}" != "$TARGET" ]; then
+        UID_PART="${TARGET%%:*}"
+        GID_PART="${TARGET##*:}"
+      else
+        UID_PART="$TARGET"
+        GID_PART="$TARGET"
+      fi
+
+      if ! is_uint "$UID_PART" || ! is_uint "$GID_PART"; then
+        return 1
+      fi
+
+      SECURE_PV_EXEC_UID="$UID_PART"
+      SECURE_PV_EXEC_GID="$GID_PART"
+      SECURE_PV_EXEC_IDENTITY_KIND="numeric"
+      export SECURE_PV_EXEC_UID SECURE_PV_EXEC_GID SECURE_PV_EXEC_IDENTITY_KIND
+      return 0
+    }
+
+    maybe_chown_mount_for_exec_identity() {
+      MNT="${VOLUME_MOUNT_POINT:-/app/data}"
+      if [ ! -d "$MNT" ]; then
+        return 0
+      fi
+      if [ "${SECURE_PV_CHOWN_RECURSIVE:-false}" = "true" ]; then
+        chown -R "${SECURE_PV_EXEC_UID}:${SECURE_PV_EXEC_GID}" "$MNT"
+      else
+        chown "${SECURE_PV_EXEC_UID}:${SECURE_PV_EXEC_GID}" "$MNT"
+      fi
+    }
+
+    secure_pv_bootstrap
+
+    if [ -n "${SECURE_PV_EXEC_AS:-}" ]; then
+      if ! resolve_exec_identity "${SECURE_PV_EXEC_AS}"; then
+        echo "secure-pv: invalid SECURE_PV_EXEC_AS identity: ${SECURE_PV_EXEC_AS}" >&2
+        exit 1
+      fi
+
+      maybe_chown_mount_for_exec_identity
+
+      if command -v setpriv >/dev/null 2>&1; then
+        STRIP_CAPS="${SECURE_PV_STRIP_RUNTIME_CAPS:-true}"
+        if [ "$STRIP_CAPS" = "true" ]; then
+          if setpriv --help 2>&1 | grep -q -- '--ambient-caps'; then
+            exec setpriv --reuid "$SECURE_PV_EXEC_UID" --regid "$SECURE_PV_EXEC_GID" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"
+          elif setpriv --help 2>&1 | grep -q -- '--inh-caps'; then
+            exec setpriv --reuid "$SECURE_PV_EXEC_UID" --regid "$SECURE_PV_EXEC_GID" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all -- "$@"
+          elif setpriv --help 2>&1 | grep -q -- '--bounding-set'; then
+            exec setpriv --reuid "$SECURE_PV_EXEC_UID" --regid "$SECURE_PV_EXEC_GID" --clear-groups --no-new-privs --bounding-set=-all -- "$@"
+          fi
+        fi
+        exec setpriv --reuid "$SECURE_PV_EXEC_UID" --regid "$SECURE_PV_EXEC_GID" --clear-groups --no-new-privs -- "$@"
+      fi
+
+      if [ "$SECURE_PV_EXEC_IDENTITY_KIND" = "named" ]; then
+        if command -v gosu >/dev/null 2>&1; then
+          exec gosu "$SECURE_PV_EXEC_AS" "$@"
+        elif command -v su-exec >/dev/null 2>&1; then
+          exec su-exec "$SECURE_PV_EXEC_AS" "$@"
+        elif command -v runuser >/dev/null 2>&1; then
+          exec runuser -u "$SECURE_PV_EXEC_AS" -- "$@"
+        fi
+      fi
+
+      echo "secure-pv: SECURE_PV_EXEC_AS requested but no supported user switch helper found; refusing to continue as root" >&2
+      exit 1
+    fi
+
+    exec "$@"
