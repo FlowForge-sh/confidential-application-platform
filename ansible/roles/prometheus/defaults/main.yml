@@ -1,0 +1,36 @@
+---
+# Prometheus Operator + exporters only (no kube-prometheus-stack, no Grafana).
+# Components: Prometheus Operator, node-exporter, kube-state-metrics, blackbox-exporter,
+# Prometheus Agent CR (scrape + remote write only). Cilium/Hubble via ServiceMonitor.
+# cAdvisor: scraped from kubelet via additional scrape configs.
+
+prometheus_namespace: monitoring
+
+# Helm repos
+prometheus_community_repo: https://prometheus-community.github.io/helm-charts
+
+# Operator: install from kube-prometheus-stack with only operator + CRDs enabled (no Grafana/Alertmanager/Prometheus instance)
+prometheus_operator_release_name: prometheus-operator
+prometheus_operator_chart: prometheus-community/kube-prometheus-stack
+# Allow group_vars prometheus_chart_version to override (e.g. all.yml). Latest: https://artifacthub.io/packages/helm/prometheus-community/kube-prometheus-stack
+prometheus_operator_chart_version: "{{ prometheus_chart_version | default('82.2.1') }}"
+
+# Exporters (separate releases in monitoring namespace)
+prometheus_node_exporter_release_name: prometheus-node-exporter
+prometheus_node_exporter_chart_version: "4.51.1"   # prometheus-community/prometheus-node-exporter
+
+prometheus_kube_state_metrics_release_name: kube-state-metrics
+prometheus_kube_state_metrics_master_release_name: kube-state-metrics-master
+prometheus_kube_state_metrics_chart_version: "7.1.0"
+# K8s API endpoint for master-node kube-state-metrics (pod can't reach 10.43.0.1; use local API).
+prometheus_kube_state_metrics_k8s_api_host: "127.0.0.1"
+prometheus_kube_state_metrics_k8s_api_port: "6443"
+
+prometheus_blackbox_exporter_release_name: prometheus-blackbox-exporter
+prometheus_blackbox_exporter_chart_version: "11.8.0"
+
+# Prometheus Agent CR name (scrape + remote write only, no local storage)
+prometheus_cr_name: prometheus
+
+# Remote write secret name (created by role from SOPS or vars)
+prometheus_remote_write_secret_name: prometheus-remote-write-basic-auth

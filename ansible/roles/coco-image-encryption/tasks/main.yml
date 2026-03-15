@@ -1,0 +1,15 @@
+---
+# Configure default KBS URL for CoCo image encryption on worker nodes
+# So pods using CoCo runtimes get attestation/image decryption without pod annotation
+
+- name: Ensure kata config.d directory exists
+  file:
+    path: "{{ coco_kata_config_d_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Deploy default KBS URL fragment for CoCo (attestation + image encryption)
+  template:
+    src: kbs-default.toml.j2
+    dest: "{{ coco_kata_config_d_dir }}/{{ coco_kbs_config_fragment_name }}"
+    mode: '0644'

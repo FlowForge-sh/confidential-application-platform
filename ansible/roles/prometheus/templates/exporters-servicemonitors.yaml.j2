@@ -1,0 +1,46 @@
+# ServiceMonitors for our Helm-installed exporters (charts may not create them or use different keys).
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-node-exporter
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: prometheus-node-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus-node-exporter
+  endpoints:
+    - port: metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kube-state-metrics
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: kube-state-metrics
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-blackbox-exporter
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: prometheus-blackbox-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus-blackbox-exporter
+  endpoints:
+    - port: http
+      interval: 30s

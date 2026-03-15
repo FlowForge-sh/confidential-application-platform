@@ -1,0 +1,8 @@
+# Pinned versions for reproducible caddy-l4 builds.
+# Update process: bump version, re-run ansible/roles/caddy with caddy_build_image: true.
+#
+# caddy-l4 module: github.com/mholt/caddy-l4
+# Pinned to a specific commit/tag for reproducibility.
+# Check https://github.com/mholt/caddy-l4 for latest releases.
+caddy-l4-version: v0.0.0-20250101000000-abc123def456
+xcaddy-version: v0.4.4

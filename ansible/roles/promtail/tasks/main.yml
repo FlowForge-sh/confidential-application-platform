@@ -1,0 +1,79 @@
+---
+# Promtail only: ship pod logs to your remote Loki. No in-cluster Loki.
+# Two DaemonSets: workers (in-cluster K8s API) + master (local K8s API 127.0.0.1:6443).
+
+- name: Ensure KUBECONFIG is set for Helm
+  set_fact:
+    ansible_env: "{{ ansible_env | default({}) | combine({'KUBECONFIG': '/root/.kube/config'}) }}"
+
+- name: Check API is reachable
+  command: k3s kubectl get ns default -o name
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: api_check
+  changed_when: false
+
+- name: Fail when remote write URL is missing
+  fail:
+    msg: "Set loki_remote_write_url (and username/password) in secrets.sops.yaml for Promtail."
+  when: loki_remote_write_url is not defined or loki_remote_write_url | length == 0
+
+- name: Add Grafana Helm repo
+  command: helm repo add grafana {{ grafana_helm_repo }}
+  changed_when: false
+
+- name: Update Helm repos
+  command: helm repo update
+  changed_when: false
+
+- name: Ensure monitoring namespace exists
+  command: k3s kubectl create namespace {{ promtail_namespace }}
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: ns_create
+  failed_when: false
+  changed_when: ns_create.rc == 0
+
+- name: Render Promtail remote write secret manifest
+  template:
+    src: remote-write-secret.yaml.j2
+    dest: /tmp/promtail-remote-write-secret.yaml
+  no_log: true
+
+- name: Apply Promtail remote write basic auth secret
+  command: k3s kubectl apply -f /tmp/promtail-remote-write-secret.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+  no_log: true
+
+- name: Render Promtail worker values (worker node(s); in-cluster K8s API)
+  template:
+    src: promtail-worker-values.yaml.j2
+    dest: /tmp/promtail-worker-values-{{ promtail_namespace }}.yaml
+
+- name: Install Promtail (worker only)
+  command: >
+    helm upgrade --install {{ promtail_helm_release_name }} grafana/promtail
+    --version {{ promtail_chart_version }}
+    --namespace {{ promtail_namespace }}
+    -f /tmp/promtail-worker-values-{{ promtail_namespace }}.yaml
+    --wait
+    --timeout 5m
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+- name: Render Promtail control-plane values (control-plane; local K8s API)
+  template:
+    src: promtail-control-plane-values.yaml.j2
+    dest: /tmp/promtail-control-plane-values-{{ promtail_namespace }}.yaml
+
+- name: Install Promtail (control-plane only; K8s API at {{ promtail_master_k8s_api_host }}:{{ promtail_master_k8s_api_port }})
+  command: >
+    helm upgrade --install {{ promtail_helm_release_name_master }} grafana/promtail
+    --version {{ promtail_chart_version }}
+    --namespace {{ promtail_namespace }}
+    -f /tmp/promtail-control-plane-values-{{ promtail_namespace }}.yaml
+    --wait
+    --timeout 5m
+  environment:
+    KUBECONFIG: /root/.kube/config

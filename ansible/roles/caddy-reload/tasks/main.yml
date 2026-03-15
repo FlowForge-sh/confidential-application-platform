@@ -1,0 +1,117 @@
+---
+# Re-render Caddy ConfigMap (base + tenant routes from ConfigMaps with caddy-route=true
+# or caddy-sni-route=true), apply and restart.
+# Requires: caddy_routes, cloudflare_tokens, caddy_namespace; hostvars['localhost'] with secrets for tenant basic auth.
+# Run on primary master (k3s kubectl).
+
+- name: Get Caddy HTTP route ConfigMaps from cluster (ops tenant routes)
+  command: k3s kubectl get configmaps -A -l caddy-route=true -o json
+  register: caddy_route_cms
+  when: enable_caddy | default(true)
+  changed_when: false
+
+- name: Get Caddy SNI route ConfigMaps from cluster (tenant L4 passthrough routes)
+  command: k3s kubectl get configmaps -A -l caddy-sni-route=true -o json
+  register: caddy_sni_route_cms
+  when: enable_caddy | default(true)
+  changed_when: false
+
+- name: Build effective SNI host allowlist (dynamic + static)
+  set_fact:
+    caddy_sni_hosts: >-
+      {{
+        (
+          ((caddy_sni_route_cms.stdout | from_json)['items'] | default([]) | map(attribute='data.host') | list)
+          +
+          (sni_routes | default([]) | map(attribute='host') | list)
+        ) | unique
+      }}
+  when: enable_caddy | default(true)
+
+- name: Build caddy_tenant_handles_per_zone from tenant HTTP route ConfigMaps
+  set_fact:
+    caddy_tenant_handles_per_zone: "{{ caddy_tenant_handles_per_zone | default({}) | combine({ zone: ((caddy_tenant_handles_per_zone | default({})).get(zone, '') + snippet) }) }}"
+  loop: "{{ (caddy_route_cms.stdout | from_json)['items'] | default([]) }}"
+  vars:
+    zone: "{{ item.data.zone | default('') }}"
+    host_safe: "{{ item.data.host | replace('.', '_') | replace('-', '_') }}"
+    auth_label: "{{ (item.metadata.labels or {}).get('caddy-route-auth', '') }}"
+    public_paths_csv: "{{ (item.data.public_paths | default('') | trim) }}"
+    public_paths_list: "{{ public_paths_csv.split(',') | map('trim') | reject('equalto', '') | list }}"
+    public_attestation_paths_csv: "{{ (item.data.public_attestation_paths | default('') | trim) }}"
+    public_attestation_paths_list: "{{ public_attestation_paths_csv.split(',') | map('trim') | reject('equalto', '') | list }}"
+    public_attestation_backend: "{{ (item.data.public_attestation_backend | default('') | trim) or item.data.backend }}"
+    public_attestation_block: "{{ ('        @' + host_safe + '_public_attestation {\n          host ' + item.data.host + '\n          path ' + (public_attestation_paths_list | join(' ')) + '\n        }\n        handle @' + host_safe + '_public_attestation {\n          reverse_proxy ' + public_attestation_backend + ' {\n            header_down -WWW-Authenticate\n          }\n        }\n') if (public_attestation_paths_list | length > 0) else '' }}"
+    public_block: "{{ ('        @' + host_safe + '_public {\n          host ' + item.data.host + '\n          path ' + (public_paths_list | join(' ')) + '\n        }\n        handle @' + host_safe + '_public {\n          reverse_proxy ' + item.data.backend + ' {\n            header_down -WWW-Authenticate\n          }\n        }\n') if (public_paths_list | length > 0) else '' }}"
+    tenant_username: "{{ hostvars['localhost'].get(item.metadata.namespace + '_mini_enclava_basic_auth_username') }}"
+    tenant_password_bcrypt: "{{ hostvars['localhost'].get(item.metadata.namespace + '_mini_enclava_basic_auth_password_bcrypt') }}"
+    auth_block: "{{ ('          basic_auth * {\n            ' + tenant_username + ' ' + tenant_password_bcrypt + '\n          }\n          ' ) if (auth_label == 'mini-enclava' and (tenant_username | default('') | length > 0) and (tenant_password_bcrypt | default('') | length > 0)) else '' }}"
+    snippet: "{{ public_attestation_block }}{{ public_block }}        @{{ host_safe }} host {{ item.data.host }}\n        handle @{{ host_safe }} {\n{{ auth_block }}          reverse_proxy {{ item.data.backend }} {\n            header_down -WWW-Authenticate\n          }\n        }\n"
+  when:
+    - enable_caddy | default(true)
+    - zone | length > 0
+    - caddy_route_cms.rc | default(1) == 0
+    - (caddy_route_cms.stdout | from_json)['items'] | default([]) | length > 0
+    - item.data.host not in (caddy_sni_hosts | default([]))
+
+- name: Build caddy_tenant_hosts_per_zone from tenant HTTP route ConfigMaps
+  set_fact:
+    caddy_tenant_hosts_per_zone: "{{ caddy_tenant_hosts_per_zone | default({}) | combine({ zone: (((caddy_tenant_hosts_per_zone | default({})).get(zone, []) + [item.data.host]) | unique) }) }}"
+  loop: "{{ (caddy_route_cms.stdout | from_json)['items'] | default([]) }}"
+  vars:
+    zone: "{{ item.data.zone | default('') }}"
+  when:
+    - enable_caddy | default(true)
+    - zone | length > 0
+    - caddy_route_cms.rc | default(1) == 0
+    - (caddy_route_cms.stdout | from_json)['items'] | default([]) | length > 0
+    - item.data.host not in (caddy_sni_hosts | default([]))
+
+- name: Ensure caddy_tenant_handles_per_zone is defined
+  set_fact:
+    caddy_tenant_handles_per_zone: "{{ caddy_tenant_handles_per_zone | default({}) }}"
+  when: enable_caddy | default(true) and caddy_tenant_handles_per_zone is not defined
+
+- name: Ensure caddy_tenant_hosts_per_zone is defined
+  set_fact:
+    caddy_tenant_hosts_per_zone: "{{ caddy_tenant_hosts_per_zone | default({}) }}"
+  when: enable_caddy | default(true) and caddy_tenant_hosts_per_zone is not defined
+
+- name: Build caddy_sni_routes list from SNI route ConfigMaps
+  set_fact:
+    caddy_sni_routes: "{{ caddy_sni_routes | default([]) + [{'host': item.data.host, 'backend_tls': item.data.backend_tls, 'tenant': item.data.tenant | default(item.metadata.namespace | default('tenant'))}] }}"
+  loop: "{{ (caddy_sni_route_cms.stdout | from_json)['items'] | default([]) }}"
+  when: enable_caddy | default(true) and caddy_sni_route_cms.rc | default(1) == 0 and (caddy_sni_route_cms.stdout | from_json)['items'] | default([]) | length > 0
+
+- name: Ensure caddy_sni_routes is defined
+  set_fact:
+    caddy_sni_routes: "{{ caddy_sni_routes | default([]) }}"
+  when: enable_caddy | default(true) and caddy_sni_routes is not defined
+
+- name: Merge static sni_routes from inventory into caddy_sni_routes
+  set_fact:
+    caddy_sni_routes: "{{ caddy_sni_routes + sni_routes }}"
+  when: enable_caddy | default(true) and sni_routes | default([]) | length > 0
+
+- name: Validate tenant/ops hostname disjointness
+  fail:
+    msg: "Hostname overlap detected between SNI tenant routes and ops HTTP routes: {{ overlap }}. Tenant and ops hostnames must be disjoint."
+  vars:
+    ops_hosts: "{{ caddy_routes | map(attribute='host') | list }}"
+    sni_hosts: "{{ caddy_sni_routes | map(attribute='host') | list }}"
+    overlap: "{{ ops_hosts | intersect(sni_hosts) }}"
+  when: enable_caddy | default(true) and (caddy_routes | map(attribute='host') | list) | intersect(caddy_sni_routes | map(attribute='host') | list) | length > 0
+
+- name: Render Caddy ConfigMap (Caddyfile) from base + tenant snippets
+  template:
+    src: configmap.yaml.j2
+    dest: /tmp/caddy-configmap.yaml
+  when: enable_caddy | default(true)
+
+- name: Apply Caddy ConfigMap
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/caddy-configmap.yaml
+  when: enable_caddy | default(true)
+
+- name: Restart Caddy to pick up config
+  command: k3s kubectl rollout restart deployment caddy -n "{{ caddy_namespace | default('caddy') }}"
+  when: enable_caddy | default(true)

@@ -1,0 +1,10 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: enclave-manifests
+  namespace: {{ flux_namespace }}
+spec:
+  interval: 1m
+  url: "{{ flux_manifests_repo_url }}"
+  ref:
+    branch: "{{ flux_manifests_repo_branch }}"

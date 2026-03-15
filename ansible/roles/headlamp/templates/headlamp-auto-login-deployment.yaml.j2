@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlamp-auto-login
+  namespace: "{{ headlamp_namespace }}"
+  labels:
+    app: headlamp-auto-login
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: headlamp-auto-login
+  template:
+    metadata:
+      labels:
+        app: headlamp-auto-login
+    spec:
+      serviceAccountName: "{{ headlamp_auto_login_sa_name | default('headlamp-admin') }}"
+      containers:
+        - name: server
+          image: python:3-alpine
+          command: ["python3", "/script/auto-login-server.py"]
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HEADLAMP_CLUSTER
+              value: "{{ headlamp_cluster_name | default('main') }}"
+            - name: HEADLAMP_APP_PATH
+              value: "{{ headlamp_base_url_value | default('') }}"
+            - name: HEADLAMP_TOKEN_FILE
+              value: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+            - name: HEADLAMP_TOKEN_SET_COOKIE_VALUE
+              value: "{{ headlamp_token_set_cookie_value | default('v2') }}"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: script
+              mountPath: /script
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+      volumes:
+        - name: script
+          configMap:
+            name: headlamp-auto-login-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlamp-auto-login
+  namespace: "{{ headlamp_namespace }}"
+  labels:
+    app: headlamp-auto-login
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: headlamp-auto-login

@@ -1,0 +1,5 @@
+---
+# Firewall: iptables only (source-based). Internal ports from firewall_internal_cidrs; public SSH 22, HTTPS 443. See defaults/main.yml.
+- name: Include iptables tasks (apply and optionally persist on boot)
+  include_tasks: iptables.yml
+  when: ansible_os_family == "Debian"

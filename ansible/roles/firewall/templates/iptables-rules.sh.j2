@@ -1,0 +1,40 @@
+#!/bin/bash
+# Ansible-managed: source-based firewall. Chain ANSIBLE-FIREWALL holds allow rules; INPUT uses it and defaults DROP.
+set -e
+IPTABLES="${IPTABLES:-/sbin/iptables}"
+CHAIN="ANSIBLE-FIREWALL"
+
+# Ensure our chain exists and is empty (idempotent re-run)
+$IPTABLES -N "$CHAIN" 2>/dev/null || true
+$IPTABLES -F "$CHAIN"
+
+# Order: internal first, then public (SSH, 443, 80).
+# Internal cluster ports: only from firewall_internal_cidrs
+{% for item in firewall_internal_rules | product(firewall_internal_cidrs) | list %}
+$IPTABLES -A "$CHAIN" -s {{ item[1] }} -p {{ item[0].proto }} --dport {{ item[0].port }} -j ACCEPT
+{% endfor %}
+{% for cidr in firewall_internal_cidrs %}
+$IPTABLES -A "$CHAIN" -s {{ cidr }} -p icmp -j ACCEPT
+{% endfor %}
+
+# Public
+{% if firewall_ssh_allowed_cidrs is defined and firewall_ssh_allowed_cidrs | length > 0 %}
+{% for cidr in firewall_ssh_allowed_cidrs %}
+$IPTABLES -A "$CHAIN" -p tcp -s {{ cidr }} --dport 22 -j ACCEPT
+{% endfor %}
+{% else %}
+$IPTABLES -A "$CHAIN" -p tcp --dport 22 -j ACCEPT
+{% endif %}
+{% if firewall_allow_ingress_ports | default(true) %}
+$IPTABLES -A "$CHAIN" -p tcp --dport 443 -j ACCEPT
+{% endif %}
+{% if firewall_allow_http_ingress | default(false) %}
+$IPTABLES -A "$CHAIN" -p tcp --dport 80 -j ACCEPT
+{% endif %}
+
+# Take full control of INPUT: default DROP, then ESTABLISHED/RELATED, loopback, our chain
+$IPTABLES -P INPUT DROP
+$IPTABLES -F INPUT
+$IPTABLES -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+$IPTABLES -A INPUT -i lo -j ACCEPT
+$IPTABLES -A INPUT -j "$CHAIN"

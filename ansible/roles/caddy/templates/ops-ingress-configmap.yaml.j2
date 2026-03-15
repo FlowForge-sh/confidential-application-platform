@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ ops_ingress_name }}-caddyfile
+  namespace: {{ ops_ingress_namespace }}
+data:
+  Caddyfile: |
+    {
+      email {{ caddy_acme_email | quote }}
+      servers {
+        trusted_proxies static private_ranges
+      }
+    }
+{% for zone in ops_ingress_routes | map(attribute='zone') | unique | list %}
+    {% set zone_hosts = ops_ingress_routes | selectattr('zone', 'equalto', zone) | map(attribute='host') | list %}
+    {% set zone_server_names = (ops_ingress_zone_wildcards | default({})).get(zone, zone_hosts | join(' ')) %}
+    {{ zone_server_names }} {
+      tls {
+        dns cloudflare {env.CF_API_TOKEN_{{ zone | replace('.', '_') | upper }}}
+        resolvers 1.1.1.1
+      }
+      route {
+{% for r in ops_ingress_routes | selectattr('zone', 'equalto', zone) %}
+        @{{ r.host | replace('.', '_') | replace('-', '_') }} host {{ r.host }}
+        handle @{{ r.host | replace('.', '_') | replace('-', '_') }} {
+{% if r.host == "headlamp-enclava.enclava.dev" %}
+          @headlamp_gate_path path /__headlamp_auth_gate
+          handle @headlamp_gate_path {
+{% if ops_ingress_basic_auth_enabled | default(true) %}
+            basic_auth * {
+              {{ ops_ingress_basic_auth_username }} {{ (ops_ingress_basic_auth_password_bcrypt if (ops_ingress_basic_auth_password_bcrypt | default('') | length > 0) else (ops_ingress_basic_auth_password | password_hash('bcrypt'))) }}
+            }
+            header {
+              Set-Cookie "headlamp_gate={{ ops_ingress_headlamp_gate_cookie }}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400"
+              Cache-Control "private, no-store"
+              Location "/"
+            }
+            respond "" 302
+{% else %}
+            redir * / 302
+{% endif %}
+          }
+          @headlamp_has_cookie {
+            header_regexp Cookie headlamp_gate={{ ops_ingress_headlamp_gate_cookie }}
+          }
+          handle @headlamp_has_cookie {
+{% if headlamp_auto_login_enabled | default(false) and headlamp_auto_login_backend is defined %}
+            @headlamp_has_token_set {
+              header_regexp Cookie headlamp_token_set={{ ops_ingress_headlamp_token_set_cookie | default('v2') }}
+            }
+            @headlamp_root_no_token path / not @headlamp_has_token_set
+            handle_path /internal-login* {
+              reverse_proxy {{ headlamp_auto_login_backend }} {
+                header_down -WWW-Authenticate
+                header_down +Cache-Control "private, no-store"
+              }
+            }
+            handle @headlamp_root_no_token {
+              redir * /internal-login 302
+            }
+{% endif %}
+            reverse_proxy {{ r.backend }} {
+              header_down -WWW-Authenticate
+              header_down +Cache-Control "private, no-store"
+            }
+          }
+          handle {
+{% if ops_ingress_basic_auth_enabled | default(true) %}
+            redir * /__headlamp_auth_gate 302
+{% else %}
+            reverse_proxy {{ r.backend }} {
+              header_down -WWW-Authenticate
+              header_down +Cache-Control "private, no-store"
+            }
+{% endif %}
+          }
+{% else %}
+{% if ops_ingress_basic_auth_enabled | default(true) %}
+          basic_auth * {
+            {{ ops_ingress_basic_auth_username }} {{ (ops_ingress_basic_auth_password_bcrypt if (ops_ingress_basic_auth_password_bcrypt | default('') | length > 0) else (ops_ingress_basic_auth_password | password_hash('bcrypt'))) }}
+          }
+{% endif %}
+          reverse_proxy {{ r.backend }} {
+            header_down -WWW-Authenticate
+          }
+{% endif %}
+        }
+{% endfor %}
+      }
+    }
+{% endfor %}

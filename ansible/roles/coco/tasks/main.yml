@@ -1,0 +1,166 @@
+---
+# Confidential Containers Deployment using Official Helm Chart (OCI)
+# Uses kubectl/helm on the master to avoid requiring Python kubernetes library on remote.
+
+- name: Check CPU confidential computing features
+  shell: |
+    if grep -q "sev" /proc/cpuinfo; then
+      echo "AMD_SEV"
+    elif grep -q "tdx" /proc/cpuinfo; then
+      echo "INTEL_TDX"
+    else
+      echo "NONE"
+    fi
+  register: cc_features
+  changed_when: false
+
+- name: Display CC capabilities
+  debug:
+    msg: "Confidential Computing Hardware: {{ cc_features.stdout }}"
+
+- name: Check if Helm 4 is installed
+  command: helm version --short
+  register: helm_version
+  changed_when: false
+  failed_when: false
+
+- name: Install Helm 4 if not present
+  shell: |
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4.sh | bash
+  args:
+    creates: /usr/local/bin/helm
+  when: helm_version.rc != 0 or "v4." not in helm_version.stdout
+
+- name: Create CoCo namespace
+  shell: k3s kubectl --kubeconfig=/root/.kube/config create namespace confidential-containers-system
+  register: ns_create
+  failed_when: false
+  changed_when: ns_create.rc == 0
+
+- name: Label CoCo namespace for pod security
+  shell: k3s kubectl --kubeconfig=/root/.kube/config label namespace confidential-containers-system pod-security.kubernetes.io/enforce=privileged --overwrite
+  when: ns_create.rc == 0
+
+- name: Create CoCo config directory
+  file:
+    path: /etc/confidential-containers
+    state: directory
+    mode: '0755'
+
+- name: Copy CoCo Helm values
+  copy:
+    src: values.yaml
+    dest: /etc/confidential-containers/values.yaml
+    mode: '0644'
+
+# Idempotency: skip install/upgrade when release exists at desired version (unless coco_force_helm_upgrade).
+- name: Get CoCo Helm release list
+  shell: KUBECONFIG=/root/.kube/config helm list -n confidential-containers-system -f '^confidential-containers$' -o json
+  register: coco_helm_list
+  failed_when: false
+  changed_when: false
+
+- name: Set CoCo deployed chart (when release exists)
+  set_fact:
+    coco_deployed_chart: "{{ (coco_helm_list.stdout | from_json)[0].chart }}"
+  when: coco_helm_list.stdout is defined and (coco_helm_list.stdout | from_json) | length > 0
+
+- name: Set CoCo skip helm (release exists at desired version, unless forcing upgrade)
+  set_fact:
+    coco_skip_helm: "{{ (coco_deployed_chart is defined and coco_deployed_chart == 'confidential-containers-' + coco_chart_version) and not (coco_force_helm_upgrade | default(false)) }}"
+
+- name: Report CoCo idempotent skip
+  debug:
+    msg: "Confidential Containers release already at {{ coco_chart_version }}; skipping install/upgrade."
+  when: coco_skip_helm | default(false)
+
+- name: Deploy Confidential Containers using Helm (OCI chart)
+  shell: >
+    KUBECONFIG=/root/.kube/config helm upgrade --install confidential-containers
+    oci://ghcr.io/confidential-containers/charts/confidential-containers
+    --version {{ coco_chart_version }}
+    --namespace confidential-containers-system
+    --create-namespace
+    --values /etc/confidential-containers/values.yaml
+    --set kata-as-coco-runtime.image.reference=quay.io/kata-containers/kata-deploy
+    --set kata-as-coco-runtime.image.tag={{ coco_kata_image_tag | default('3.27.0') }}
+    --wait
+    --timeout 10m
+  register: coco_helm_result
+  retries: 2
+  until: coco_helm_result.rc == 0
+  delay: 30
+  when: not (coco_skip_helm | default(false))
+
+# Kata 3.27+ image uses /usr/bin/kata-deploy binary; CoCo chart still sets old script path.
+# Patch the DaemonSet so the container starts. Run after Helm (or when release exists) so
+# the DaemonSet is present.
+- name: Patch kata-as-coco-runtime DaemonSet for Kata 3.27+ image (binary not script)
+  shell: >
+    k3s kubectl --kubeconfig=/root/.kube/config patch daemonset kata-as-coco-runtime
+    -n confidential-containers-system
+    --type=json
+    -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/command", "value": ["/usr/bin/kata-deploy", "install"]}]'
+  register: coco_ds_patch
+  failed_when: false
+  changed_when: coco_ds_patch.rc == 0
+
+- name: Restart kata-as-coco-runtime pods to apply command patch
+  shell: >
+    k3s kubectl --kubeconfig=/root/.kube/config rollout restart daemonset/kata-as-coco-runtime
+    -n confidential-containers-system
+  when: coco_ds_patch.rc == 0
+
+- name: Wait for CoCo runtime DaemonSet to be ready
+  # Chart deploys a DaemonSet (commonly named `kata-as-coco-runtime`).
+  # Using rollout status is more reliable than waiting on a specific pod label.
+  shell: k3s kubectl --kubeconfig=/root/.kube/config rollout status daemonset/kata-as-coco-runtime -n confidential-containers-system --timeout=600s
+  register: ds_wait
+  retries: 3
+  until: ds_wait.rc == 0
+  delay: 10
+  changed_when: false
+  ignore_errors: true
+  when: coco_ds_patch.rc == 0 or not (coco_skip_helm | default(false))
+
+- name: Copy RuntimeClass manifests
+  copy:
+    src: runtimeclasses.yaml
+    dest: /etc/confidential-containers/runtimeclasses.yaml
+    mode: '0644'
+
+- name: Apply RuntimeClasses
+  shell: k3s kubectl --kubeconfig=/root/.kube/config apply -f /etc/confidential-containers/runtimeclasses.yaml
+  register: rc_apply
+  failed_when: false
+  changed_when: rc_apply.rc == 0
+
+- name: Create CoCo installation summary
+  copy:
+    dest: /etc/confidential-containers/README.txt
+    content: |
+      Confidential Containers v{{ coco_chart_version }}
+      Deployed via Helm Chart (OCI)
+      
+      Hardware Support: {{ cc_features.stdout }}
+      
+      Available RuntimeClasses:
+      - kata-qemu-snp    (AMD SEV-SNP)
+      - kata-qemu-tdx    (Intel TDX)
+      - kata-coco-dev    (Testing without TEE)
+      
+      Usage:
+        kubectl apply -f pod.yaml
+      
+      Where pod.yaml contains:
+        spec:
+          runtimeClassName: kata-qemu-snp  # or kata-qemu-tdx
+      
+      Verify installation:
+        kubectl get runtimeclass
+        kubectl get pods -n confidential-containers-system
+        kubectl logs -n confidential-containers-system -l name=kata-deploy
+      
+      Documentation:
+        https://confidentialcontainers.org/docs/
+    mode: '0644'

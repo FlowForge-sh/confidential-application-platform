@@ -1,0 +1,168 @@
+---
+- name: Check if K3s agent is already installed
+  stat:
+    path: /usr/local/bin/k3s
+  register: k3s_agent_binary
+
+- name: Ensure cluster token is available
+  assert:
+    that:
+      - k3s_cluster_token is defined
+      - k3s_cluster_token | length > 0
+    fail_msg: "K3s cluster token is required to join worker nodes"
+
+- name: Ensure server URL is available
+  assert:
+    that:
+      - k3s_server_url is defined
+      - k3s_server_url | length > 0
+    fail_msg: "K3s server URL is required to join worker nodes"
+
+- name: Display worker join information
+  debug:
+    msg:
+      - "Server URL: {{ k3s_server_url }}"
+      - "Worker hostname: {{ ansible_hostname }}"
+
+# Download on controller and copy to worker so workers without outbound internet (e.g. Hetzner dedicated) do not fail.
+- name: Ensure K3s install script cache dir exists on controller
+  file:
+    path: "{{ playbook_dir }}/../../.cache"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+  become: false
+
+- name: Download K3s installation script (on controller)
+  get_url:
+    url: "{{ k3s_install_url }}"
+    dest: "{{ playbook_dir }}/../../.cache/k3s-install.sh"
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+  become: false
+  register: k3s_script_download
+
+- name: Copy K3s installation script to node
+  copy:
+    src: "{{ playbook_dir }}/../../.cache/k3s-install.sh"
+    dest: /tmp/k3s-install.sh
+    mode: '0755'
+    local_follow: true
+
+# Worker may have no outbound internet; download binary on controller and copy so install script can use SKIP_DOWNLOAD.
+- name: Download K3s binary (on controller) for worker arch
+  get_url:
+    url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version | replace('+', '%2B') }}/{{ 'k3s-arm64' if ansible_architecture == 'aarch64' else 'k3s' }}"
+    dest: "{{ playbook_dir }}/../../.cache/k3s-{{ ansible_architecture }}"
+    mode: '0755'
+  delegate_to: localhost
+  become: false
+  register: k3s_binary_download
+
+- name: Copy K3s binary to node
+  copy:
+    src: "{{ playbook_dir }}/../../.cache/k3s-{{ ansible_architecture }}"
+    dest: /usr/local/bin/k3s
+    mode: '0755'
+    local_follow: true
+
+- name: Install K3s agent (use pre-copied binary, skip download)
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_SKIP_DOWNLOAD: "true"
+    INSTALL_K3S_EXEC: "agent --node-ip {{ private_ip | default(ansible_host) }}"
+    K3S_URL: "{{ k3s_server_url }}"
+    K3S_TOKEN: "{{ k3s_cluster_token }}"
+  shell: /tmp/k3s-install.sh
+  register: k3s_agent_install
+  async: "{{ k3s_join_timeout }}"
+  poll: 10
+
+- name: Enable and start K3s agent service
+  systemd:
+    name: k3s-agent
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Ensure K3s config directory exists on worker
+  file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: '0755'
+
+- name: Remove registries.yaml if present (embedded registry no longer used)
+  file:
+    path: /etc/rancher/k3s/registries.yaml
+    state: absent
+  failed_when: false
+
+- name: Wait for K3s agent to be ready
+  wait_for:
+    path: /run/k3s/containerd/containerd.sock
+    state: present
+    timeout: 120
+
+- name: Verify containerd is running
+  command: ctr --address /run/k3s/containerd/containerd.sock version
+  register: containerd_version
+  retries: 10
+  delay: 5
+  until: containerd_version.rc == 0
+  changed_when: false
+
+- name: Display containerd version
+  debug:
+    var: containerd_version.stdout_lines
+
+- name: Check available runtimes
+  shell: ctr --address /run/k3s/containerd/containerd.sock plugins ls | grep runtime
+  register: available_runtimes
+  changed_when: false
+  failed_when: false
+
+- name: Display available runtimes
+  debug:
+    var: available_runtimes.stdout_lines
+  when: available_runtimes.rc == 0
+
+- name: Verify Kata runtime is available
+  shell: ctr --address /run/k3s/containerd/containerd.sock plugins ls | grep kata
+  register: kata_runtime_check
+  changed_when: false
+  failed_when: false
+
+- name: Display Kata runtime status
+  debug:
+    msg: "{{ 'Kata runtime is available in containerd' if kata_runtime_check.rc == 0 else 'Kata runtime not found in containerd' }}"
+
+# Workers must not have kubectl or kubeconfig; cluster access only from control plane
+- name: Remove kubectl from worker (no cluster API access on worker)
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/local/bin/kubectl
+    - /root/.kube
+  failed_when: false
+
+- name: Remove kubectl aliases from worker .bashrc if present
+  blockinfile:
+    path: /root/.bashrc
+    block: ""
+    marker: "# {mark} KUBECTL ALIASES"
+    state: absent
+  failed_when: false
+
+- name: Display worker join success
+  debug:
+    msg:
+      - "K3s worker {{ ansible_hostname }} configured successfully!"
+      - "Server: {{ k3s_server_url }}"
+      - "Kata runtime: {{ 'Available' if kata_runtime_check.rc == 0 else 'Not available' }}"
+      - ""
+      - "Verify from master:"
+      - "  kubectl get node {{ ansible_hostname }}"
+      - "  kubectl describe node {{ ansible_hostname }}"

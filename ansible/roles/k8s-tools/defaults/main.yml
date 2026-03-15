@@ -1,0 +1,11 @@
+---
+# K8s / tenant deploy tools: kustomize, sops, age, k9s (no ksops).
+# Used on masters for k8s/tenants overlay apply (decrypt with SOPS then kustomize build).
+
+# Versions (override in group_vars if needed)
+kustomize_version: "5.4.2"
+sops_version: "3.11.0"
+k9s_version: "0.32.4"
+
+# Install all tools when true (e.g. set true for masters in group_vars/masters.yml)
+install_k8s_tools: false

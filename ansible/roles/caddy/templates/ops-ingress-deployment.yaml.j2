@@ -1,0 +1,112 @@
+{% if ops_ingress_use_persistent_storage | default(true) %}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ ops_ingress_name }}-data
+  namespace: "{{ ops_ingress_namespace }}"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: "{{ ops_ingress_storage_size }}"
+{% if ops_ingress_storage_class | default('') | length > 0 %}
+  storageClassName: "{{ ops_ingress_storage_class }}"
+{% endif %}
+---
+{% endif %}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ ops_ingress_name }}"
+  namespace: "{{ ops_ingress_namespace }}"
+  labels:
+    app: "{{ ops_ingress_name }}"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: "{{ ops_ingress_name }}"
+  template:
+    metadata:
+      labels:
+        app: "{{ ops_ingress_name }}"
+    spec:
+      containers:
+        - name: caddy
+          image: "{{ ops_ingress_image }}"
+          imagePullPolicy: Never
+          command:
+            - caddy
+            - run
+            - --config
+            - /etc/caddy/Caddyfile
+          ports:
+            - containerPort: 443
+              name: https
+          env:
+{% for zone in ops_ingress_routes | map(attribute='zone') | unique | list %}
+            - name: CF_API_TOKEN_{{ zone | replace('.', '_') | upper }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ ops_ingress_name }}-cloudflare-token
+                  key: api_token_{{ zone | replace('.', '_') }}
+{% endfor %}
+            - name: XDG_DATA_HOME
+              value: /data/caddy
+          volumeMounts:
+            - name: caddyfile
+              mountPath: /etc/caddy
+              readOnly: true
+            - name: caddy-data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+            runAsUser: 0
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: {{ ops_ingress_name }}-caddyfile
+        - name: caddy-data
+{% if ops_ingress_use_persistent_storage | default(true) %}
+          persistentVolumeClaim:
+            claimName: {{ ops_ingress_name }}-data
+{% else %}
+          emptyDir: {}
+{% endif %}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{{ ops_ingress_name }}"
+  namespace: "{{ ops_ingress_namespace }}"
+spec:
+  selector:
+    app: "{{ ops_ingress_name }}"
+  ports:
+    - name: https
+      port: 443
+      targetPort: 443

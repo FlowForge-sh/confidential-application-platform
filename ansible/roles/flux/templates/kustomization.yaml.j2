@@ -1,0 +1,17 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: enclave-manifests
+  namespace: {{ flux_namespace }}
+spec:
+  suspend: {{ flux_manual_sync | default(true) }}
+  interval: 10m
+  sourceRef:
+    kind: GitRepository
+    name: enclave-manifests
+  path: "{{ flux_manifests_repo_path }}"
+  prune: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: {{ flux_sops_age_secret_name }}

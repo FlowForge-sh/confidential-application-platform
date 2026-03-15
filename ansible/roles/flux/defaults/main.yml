@@ -1,0 +1,24 @@
+---
+# Flux CD (GitOps). Install controllers, SOPS secret, GitRepository, Kustomization, and optional UI.
+# Repo URL/path and SOPS key come from group_vars (flux_manifests_repo_*, flux_sops_age_key_file).
+
+flux_version: "{{ flux_version | default('2.8.1') }}"
+flux_install_controllers: true
+flux_namespace: flux-system
+flux_sops_age_secret_name: sops-age
+
+# Manifests repo (set in group_vars)
+flux_manifests_repo_url: "{{ flux_manifests_repo_url | default('') }}"
+flux_manifests_repo_branch: "{{ flux_manifests_repo_branch | default('main') }}"
+flux_manifests_repo_path: "{{ flux_manifests_repo_path | default('.') }}"
+
+# When true, Kustomization is suspended (manual sync via flux reconcile).
+flux_manual_sync: "{{ flux_manual_sync | default(true) }}"
+
+# SOPS key: content (Vault) or path on master (playbook copies from flux_sops_age_key_file).
+flux_sops_age_key_content: ""
+flux_sops_age_key_path: ""
+
+# Flux UI (Capacitor)
+flux_ui_enabled: "{{ flux_ui_enabled | default(false) }}"
+flux_ui_namespace: "{{ flux_namespace }}"

@@ -1,0 +1,5 @@
+# Default KBS URL for CoCo attestation and image encryption
+# Injected by Ansible; Trustee (KBS) is deployed in trustee-operator-system
+# See: ansible/roles/trustee-operator/
+[hypervisor.qemu]
+kernel_params = "agent.aa_kbc_params=cc_kbc::{{ coco_kbs_default_url }}"

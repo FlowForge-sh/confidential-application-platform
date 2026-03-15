@@ -1,0 +1,94 @@
+---
+# K3s Server Configuration (see https://docs.k3s.io/installation/configuration)
+write-kubeconfig-mode: "0644"
+{% if is_primary | default(false) %}
+# Initialize new cluster with embedded etcd (primary master only)
+cluster-init: true
+{% endif %}
+
+# API server: bind 0.0.0.0 so bootstrap completes (readyz/kubernetes Service endpoints need
+# local listener). Advertise private IP so cluster traffic uses private network only.
+# For private-only: block 6443 on public interface with firewall (see docs).
+bind-address: "0.0.0.0"
+advertise-address: "{{ private_ip | default(ansible_host) }}"
+# Node IP so etcd and all components use private IP (not default route)
+node-ip: "{{ private_ip | default(ansible_host) }}"
+
+# TLS SAN entries
+tls-san:
+  - "{{ ansible_host }}"
+{% if private_ip is defined and private_ip != ansible_host %}
+  - "{{ private_ip }}"
+{% endif %}
+  - "{{ inventory_hostname }}"
+  - "localhost"
+  - "127.0.0.1"
+
+# Network configuration
+cluster-cidr: "{{ cluster_cidr }}"
+service-cidr: "{{ service_cidr }}"
+cluster-dns: "{{ cluster_dns }}"
+
+# Disable built-in components. Keep servicelb enabled so Caddy LoadBalancer gets an external IP.
+# Do NOT disable coredns: per https://docs.cilium.io/en/stable/installation/k3s/ K3s runs
+# CoreDNS by default and Cilium works with it; disabling would require a custom DNS deployment.
+disable:
+  - traefik
+  - local-storage
+
+# Disable Flannel (using Cilium instead). Required for Cilium CNI.
+flannel-backend: none
+
+# Disable kube-proxy (Cilium replaces it; required for kubeProxyReplacement).
+# See: https://docs.cilium.io/en/stable/installation/k3s/
+disable-kube-proxy: true
+
+# Disable built-in network policy (Cilium handles this)
+disable-network-policy: true
+
+# Disable cloud controller
+disable-cloud-controller: true
+
+# API Server arguments
+kube-apiserver-arg:
+  - "anonymous-auth=false"
+  - "profiling=false"
+  - "audit-log-path=/var/log/kubernetes/audit.log"
+  - "audit-log-maxage=30"
+  - "audit-log-maxbackup=10"
+  - "audit-log-maxsize=100"
+  - "admission-control-config-file={{ k3s_pod_security_admission_config_path }}"
+  - "enable-admission-plugins=NodeRestriction"
+
+# Controller Manager arguments
+kube-controller-manager-arg:
+  - "profiling=false"
+  - "terminated-pod-gc-threshold=100"
+  - "node-cidr-mask-size=24"
+
+# Scheduler arguments
+kube-scheduler-arg:
+  - "profiling=false"
+
+# Kubelet arguments
+kubelet-arg:
+  - "protect-kernel-defaults=true"
+  - "streaming-connection-idle-timeout=5m"
+  - "make-iptables-util-chains=true"
+
+# Etcd configuration
+{% if (master_count | default(1) | int) > 1 %}
+etcd-expose-metrics: true
+etcd-snapshot-schedule-cron: "0 */6 * * *"
+etcd-snapshot-retention: 7
+{% endif %}
+
+# Node labels: do not set node-role.kubernetes.io/* or node.kubernetes.io/* (except allowed set);
+# kubelet rejects them (K8s 1.27+). K3s still marks server nodes as control-plane,etcd,master.
+# Optional custom label for node selection (no kubernetes.io prefix):
+node-label:
+  - "k3s.io/node=master"
+
+# Node taints (prevent workloads on master). Format: key=value:effect (empty value = :)
+node-taint:
+  - "node-role.kubernetes.io/master=:NoSchedule"

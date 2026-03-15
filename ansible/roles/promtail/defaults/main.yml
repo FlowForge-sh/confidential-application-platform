@@ -1,0 +1,14 @@
+---
+# Promtail: collect pod logs and send to your remote Loki (no in-cluster Loki).
+# One Loki endpoint; two DaemonSets: workers use in-cluster K8s API, master uses local API (avoids 10.43.0.1 timeout on control-plane).
+
+promtail_namespace: monitoring
+promtail_helm_release_name: promtail
+promtail_helm_release_name_master: promtail-master
+promtail_chart_version: "6.17.1"   # grafana/promtail (latest)
+grafana_helm_repo: https://grafana.github.io/helm-charts
+promtail_remote_write_secret_name: loki-remote-write-basic-auth
+
+# K8s API endpoint for the master-node Promtail (control-plane can't reach 10.43.0.1 from pods).
+promtail_master_k8s_api_host: "127.0.0.1"
+promtail_master_k8s_api_port: "6443"

@@ -1,0 +1,42 @@
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:
+        enforce: "privileged"
+        enforce-version: "latest"
+        audit: "privileged"
+        audit-version: "latest"
+        warn: "privileged"
+        warn-version: "latest"
+      exemptions:
+{% set psa_usernames = k3s_pod_security_username_exemptions | default([]) %}
+        usernames:
+{% if psa_usernames | length == 0 %}
+          []
+{% else %}
+{% for username in psa_usernames %}
+          - "{{ username }}"
+{% endfor %}
+{% endif %}
+{% set psa_runtimeclasses = k3s_pod_security_runtimeclass_exemptions | default([]) %}
+        runtimeClasses:
+{% if psa_runtimeclasses | length == 0 %}
+          []
+{% else %}
+{% for runtimeclass in psa_runtimeclasses %}
+          - "{{ runtimeclass }}"
+{% endfor %}
+{% endif %}
+{% set psa_namespaces = k3s_pod_security_namespace_exemptions | default([]) %}
+        namespaces:
+{% if psa_namespaces | length == 0 %}
+          []
+{% else %}
+{% for namespace in psa_namespaces %}
+          - "{{ namespace }}"
+{% endfor %}
+{% endif %}

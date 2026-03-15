@@ -1,0 +1,317 @@
+---
+- name: Require cloudflare_tokens (per-zone) for DNS-01
+  fail:
+    msg: "Set cloudflare_tokens (zone -> token) in secrets.sops.yaml and ensure the play loads it. See inventory/group_vars/secrets.sops.schema.yaml."
+  when: cloudflare_tokens is not defined or cloudflare_tokens | length == 0
+
+- name: Validate caddy_routes zones
+  fail:
+    msg: "Each caddy_route must have 'zone' matching a key in cloudflare_tokens. Routes: {{ caddy_routes | map(attribute='host') | list }}; zones: {{ cloudflare_tokens.keys() | list }}."
+  when: >
+    caddy_routes | rejectattr('zone', 'defined') | list | length > 0
+    or caddy_routes | selectattr('zone', 'defined') | map(attribute='zone') | list | reject('in', cloudflare_tokens.keys() | list) | list | length > 0
+
+- name: Validate ops_ingress_routes zones
+  fail:
+    msg: "Each ops_ingress_route must have 'zone' matching a key in cloudflare_tokens. Routes: {{ ops_ingress_routes | map(attribute='host') | list }}; zones: {{ cloudflare_tokens.keys() | list }}."
+  when: >
+    ops_ingress_enabled | default(false)
+    and (
+      ops_ingress_routes | rejectattr('zone', 'defined') | list | length > 0
+      or ops_ingress_routes | selectattr('zone', 'defined') | map(attribute='zone') | list | reject('in', cloudflare_tokens.keys() | list) | list | length > 0
+    )
+
+- name: Require ops_ingress_routes when ops_ingress is enabled
+  fail:
+    msg: "ops_ingress_enabled=true requires at least one ops_ingress_route."
+  when: ops_ingress_enabled | default(false) and (ops_ingress_routes | default([]) | length == 0)
+
+- name: Validate caddy_routes and ops_ingress_routes hostname disjointness
+  fail:
+    msg: "Hostname overlap between edge caddy_routes and ops_ingress_routes: {{ overlap }}. A hostname must be owned by exactly one ingress path."
+  vars:
+    edge_hosts: "{{ caddy_routes | map(attribute='host') | list }}"
+    ops_ingress_hosts: "{{ ops_ingress_routes | default([]) | map(attribute='host') | list }}"
+    overlap: "{{ edge_hosts | intersect(ops_ingress_hosts) }}"
+  when: >
+    ops_ingress_enabled | default(false)
+    and (caddy_routes | map(attribute='host') | list)
+       | intersect(ops_ingress_routes | default([]) | map(attribute='host') | list)
+       | length > 0
+
+- name: Validate tenant/ops hostname disjointness (static sni_routes vs caddy_routes)
+  fail:
+    msg: "Hostname overlap between sni_routes and caddy_routes: {{ overlap }}. Tenant SNI hostnames must be disjoint from ops HTTP hostnames."
+  vars:
+    ops_hosts: "{{ caddy_routes | map(attribute='host') | list }}"
+    sni_hosts: "{{ sni_routes | default([]) | map(attribute='host') | list }}"
+    overlap: "{{ ops_hosts | intersect(sni_hosts) }}"
+  when: (caddy_routes | map(attribute='host') | list) | intersect(sni_routes | default([]) | map(attribute='host') | list) | length > 0
+
+- name: Create Caddy namespace
+  command: k3s kubectl create namespace {{ caddy_namespace }}
+  register: ns_create
+  failed_when: false
+  changed_when: ns_create.rc == 0
+
+- name: Create ops-ingress namespace
+  command: k3s kubectl create namespace {{ ops_ingress_namespace }}
+  register: ops_ns_create
+  failed_when: false
+  changed_when: ops_ns_create.rc == 0
+  when: ops_ingress_enabled | default(false)
+
+# Build Caddy image from files/Dockerfile on this host and import into K3s (no third-party image).
+- name: Ensure AppArmor is installed (Docker needs apparmor_parser for its default profile)
+  apt:
+    name: apparmor
+    state: present
+  when: ((caddy_build_image | default(true)) or (caddy_build_ingress_image | default(true))) and ansible_os_family == "Debian"
+
+- name: Ensure Docker is installed (for building Caddy image)
+  apt:
+    name: docker.io
+    state: present
+  when: (caddy_build_image | default(true)) or (caddy_build_ingress_image | default(true))
+
+- name: Ensure Docker service is started (and restart to load AppArmor if needed)
+  systemd:
+    name: docker
+    state: restarted
+    daemon_reload: true
+  when: (caddy_build_image | default(true)) or (caddy_build_ingress_image | default(true))
+
+- name: Create Caddy build directory
+  file:
+    path: /tmp/caddy-build
+    state: directory
+    mode: "0755"
+  when: (caddy_build_image | default(true)) or (caddy_build_ingress_image | default(true))
+
+- name: Copy Caddy Dockerfile to build directory
+  copy:
+    src: Dockerfile
+    dest: /tmp/caddy-build/Dockerfile
+  when: caddy_build_image | default(true)
+
+- name: Build Caddy image with caddy-l4 and Cloudflare DNS plugins
+  command: >
+    docker build
+    --build-arg CADDY_VERSION={{ caddy_version | default('2.10.0') }}
+    --build-arg CADDY_L4_VERSION={{ caddy_l4_version | default('latest') }}
+    -t {{ caddy_image }}
+    -f /tmp/caddy-build/Dockerfile
+    /tmp/caddy-build
+  register: caddy_docker_build
+  changed_when: caddy_docker_build.rc == 0
+  when: caddy_build_image | default(true)
+
+- name: Import Caddy image into K3s containerd
+  shell: docker save {{ caddy_image }} | k3s ctr images import -
+  args:
+    executable: /bin/bash
+  when: caddy_build_image | default(true) and (caddy_docker_build is changed or caddy_docker_build.rc is defined)
+
+- name: Copy tenant-ingress Dockerfile to build directory
+  copy:
+    src: Dockerfile.ingress
+    dest: /tmp/caddy-build/Dockerfile.ingress
+  when: caddy_build_ingress_image | default(true)
+
+- name: Build tenant-ingress image (caddy + cloudflare-dns + cryptsetup)
+  command: >
+    docker build
+    --build-arg CADDY_VERSION={{ caddy_version | default('2.10.0') }}
+    -t {{ caddy_ingress_image }}
+    -f /tmp/caddy-build/Dockerfile.ingress
+    /tmp/caddy-build
+  register: caddy_ingress_docker_build
+  changed_when: caddy_ingress_docker_build.rc == 0
+  when: caddy_build_ingress_image | default(true)
+
+- name: Import tenant-ingress image into K3s containerd
+  shell: docker save {{ caddy_ingress_image }} | k3s ctr images import -
+  args:
+    executable: /bin/bash
+  when: caddy_build_ingress_image | default(true) and (caddy_ingress_docker_build is changed or caddy_ingress_docker_build.rc is defined)
+
+- name: Render Cloudflare tokens secret
+  template:
+    src: secret-cloudflare-token.yaml.j2
+    dest: /tmp/caddy-cloudflare-secret.yaml
+  no_log: true
+
+- name: Apply Cloudflare tokens secret
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/caddy-cloudflare-secret.yaml
+  no_log: true
+
+- name: Remove rendered secret file
+  file:
+    path: /tmp/caddy-cloudflare-secret.yaml
+    state: absent
+  changed_when: false
+
+- name: Render ops-ingress Cloudflare token secret
+  template:
+    src: ops-ingress-secret-cloudflare-token.yaml.j2
+    dest: /tmp/ops-ingress-cloudflare-secret.yaml
+  no_log: true
+  when: ops_ingress_enabled | default(false)
+
+- name: Apply ops-ingress Cloudflare token secret
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/ops-ingress-cloudflare-secret.yaml
+  no_log: true
+  when: ops_ingress_enabled | default(false)
+
+- name: Remove rendered ops-ingress secret file
+  file:
+    path: /tmp/ops-ingress-cloudflare-secret.yaml
+    state: absent
+  changed_when: false
+  when: ops_ingress_enabled | default(false)
+
+- name: Render ops-ingress Caddyfile ConfigMap
+  template:
+    src: ops-ingress-configmap.yaml.j2
+    dest: /tmp/ops-ingress-configmap.yaml
+  when: ops_ingress_enabled | default(false)
+
+- name: Apply ops-ingress Caddyfile ConfigMap
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/ops-ingress-configmap.yaml
+  when: ops_ingress_enabled | default(false)
+
+- name: Render ops-ingress PVC, Deployment and Service
+  template:
+    src: ops-ingress-deployment.yaml.j2
+    dest: /tmp/ops-ingress-deployment.yaml
+  when: ops_ingress_enabled | default(false)
+
+- name: Apply ops-ingress PVC, Deployment and Service
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/ops-ingress-deployment.yaml
+  when: ops_ingress_enabled | default(false)
+
+- name: Wait for ops-ingress deployment
+  command: k3s kubectl -n {{ ops_ingress_namespace }} rollout status deployment/{{ ops_ingress_name }} --timeout=180s
+  changed_when: false
+  when: ops_ingress_enabled | default(false)
+
+- name: Get Caddy HTTP route ConfigMaps from cluster (ops tenant routes)
+  command: k3s kubectl get configmaps -A -l caddy-route=true -o json
+  register: caddy_route_cms
+  changed_when: false
+
+- name: Get Caddy SNI route ConfigMaps from cluster (tenant L4 passthrough routes)
+  command: k3s kubectl get configmaps -A -l caddy-sni-route=true -o json
+  register: caddy_sni_route_cms
+  changed_when: false
+
+- name: Build effective SNI host allowlist (dynamic + static)
+  set_fact:
+    caddy_sni_hosts: >-
+      {{
+        (
+          ((caddy_sni_route_cms.stdout | from_json)['items'] | default([]) | map(attribute='data.host') | list)
+          +
+          (sni_routes | default([]) | map(attribute='host') | list)
+        ) | unique
+      }}
+
+- name: Build caddy_tenant_handles_per_zone from tenant HTTP route ConfigMaps
+  set_fact:
+    caddy_tenant_handles_per_zone: "{{ caddy_tenant_handles_per_zone | default({}) | combine({ zone: ((caddy_tenant_handles_per_zone | default({})).get(zone, '') + snippet) }) }}"
+  loop: "{{ (caddy_route_cms.stdout | from_json)['items'] | default([]) }}"
+  vars:
+    zone: "{{ item.data.zone | default('') }}"
+    host_safe: "{{ item.data.host | replace('.', '_') | replace('-', '_') }}"
+    auth_label: "{{ item.metadata.labels['caddy-route-auth'] | default('') }}"
+    public_paths_csv: "{{ (item.data.public_paths | default('') | trim) }}"
+    public_paths_list: "{{ public_paths_csv.split(',') | map('trim') | reject('equalto', '') | list }}"
+    public_attestation_paths_csv: "{{ (item.data.public_attestation_paths | default('') | trim) }}"
+    public_attestation_paths_list: "{{ public_attestation_paths_csv.split(',') | map('trim') | reject('equalto', '') | list }}"
+    public_attestation_backend: "{{ (item.data.public_attestation_backend | default('') | trim) or item.data.backend }}"
+    public_attestation_block: "{{ ('        @' + host_safe + '_public_attestation {\n          host ' + item.data.host + '\n          path ' + (public_attestation_paths_list | join(' ')) + '\n        }\n        handle @' + host_safe + '_public_attestation {\n          reverse_proxy ' + public_attestation_backend + ' {\n            header_down -WWW-Authenticate\n          }\n        }\n') if (public_attestation_paths_list | length > 0) else '' }}"
+    public_block: "{{ ('        @' + host_safe + '_public {\n          host ' + item.data.host + '\n          path ' + (public_paths_list | join(' ')) + '\n        }\n        handle @' + host_safe + '_public {\n          reverse_proxy ' + item.data.backend + ' {\n            header_down -WWW-Authenticate\n          }\n        }\n') if (public_paths_list | length > 0) else '' }}"
+    tenant_username: "{{ hostvars['localhost'].get(item.metadata.namespace + '_mini_enclava_basic_auth_username') }}"
+    tenant_password_bcrypt: "{{ hostvars['localhost'].get(item.metadata.namespace + '_mini_enclava_basic_auth_password_bcrypt') }}"
+    auth_block: "{{ ('          basic_auth * {\n            ' + tenant_username + ' ' + tenant_password_bcrypt + '\n          }\n          ' ) if (auth_label == 'mini-enclava' and (tenant_username | default('') | length > 0) and (tenant_password_bcrypt | default('') | length > 0)) else '' }}"
+    snippet: "{{ public_attestation_block }}{{ public_block }}        @{{ host_safe }} host {{ item.data.host }}\n        handle @{{ host_safe }} {\n{{ auth_block }}          reverse_proxy {{ item.data.backend }} {\n            header_down -WWW-Authenticate\n          }\n        }\n"
+  when:
+    - zone | length > 0
+    - (caddy_route_cms.stdout | from_json)['items'] | default([]) | length > 0
+    - item.data.host not in (caddy_sni_hosts | default([]))
+
+- name: Build caddy_tenant_hosts_per_zone from tenant HTTP route ConfigMaps
+  set_fact:
+    caddy_tenant_hosts_per_zone: "{{ caddy_tenant_hosts_per_zone | default({}) | combine({ zone: (((caddy_tenant_hosts_per_zone | default({})).get(zone, []) + [item.data.host]) | unique) }) }}"
+  loop: "{{ (caddy_route_cms.stdout | from_json)['items'] | default([]) }}"
+  vars:
+    zone: "{{ item.data.zone | default('') }}"
+  when:
+    - zone | length > 0
+    - (caddy_route_cms.stdout | from_json)['items'] | default([]) | length > 0
+    - item.data.host not in (caddy_sni_hosts | default([]))
+
+- name: Ensure caddy_tenant_handles_per_zone is defined
+  set_fact:
+    caddy_tenant_handles_per_zone: "{{ caddy_tenant_handles_per_zone | default({}) }}"
+  when: caddy_tenant_handles_per_zone is not defined
+
+- name: Ensure caddy_tenant_hosts_per_zone is defined
+  set_fact:
+    caddy_tenant_hosts_per_zone: "{{ caddy_tenant_hosts_per_zone | default({}) }}"
+  when: caddy_tenant_hosts_per_zone is not defined
+
+- name: Build caddy_sni_routes list from SNI route ConfigMaps
+  set_fact:
+    caddy_sni_routes: "{{ caddy_sni_routes | default([]) + [{'host': item.data.host, 'backend_tls': item.data.backend_tls, 'tenant': item.data.tenant | default(item.metadata.namespace | default('tenant'))}] }}"
+  loop: "{{ (caddy_sni_route_cms.stdout | from_json)['items'] | default([]) }}"
+  when: (caddy_sni_route_cms.stdout | from_json)['items'] | default([]) | length > 0
+
+- name: Ensure caddy_sni_routes is defined
+  set_fact:
+    caddy_sni_routes: "{{ caddy_sni_routes | default([]) }}"
+  when: caddy_sni_routes is not defined
+
+- name: Merge static sni_routes from inventory into caddy_sni_routes
+  set_fact:
+    caddy_sni_routes: "{{ caddy_sni_routes + sni_routes }}"
+  when: sni_routes | default([]) | length > 0
+
+- name: Validate tenant/ops hostname disjointness (dynamic cluster routes)
+  fail:
+    msg: "Hostname overlap between cluster SNI routes and ops HTTP routes: {{ overlap }}. Tenant and ops hostnames must be disjoint."
+  vars:
+    ops_hosts: "{{ caddy_routes | map(attribute='host') | list }}"
+    sni_hosts: "{{ caddy_sni_routes | map(attribute='host') | list }}"
+    overlap: "{{ ops_hosts | intersect(sni_hosts) }}"
+  when: (caddy_routes | map(attribute='host') | list) | intersect(caddy_sni_routes | map(attribute='host') | list) | length > 0
+
+- name: Render Caddy ConfigMap (Caddyfile)
+  template:
+    src: configmap.yaml.j2
+    dest: /tmp/caddy-configmap.yaml
+
+- name: Apply Caddy ConfigMap
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/caddy-configmap.yaml
+
+- name: Render Caddy PVC, Deployment and Service
+  template:
+    src: deployment.yaml.j2
+    dest: /tmp/caddy-deployment.yaml
+
+- name: Apply Caddy PVC, Deployment and Service
+  command: k3s kubectl --kubeconfig=/root/.kube/config apply -f /tmp/caddy-deployment.yaml
+
+- name: Remove legacy caddy nodeSelector if present (prevents worker+control-plane scheduling conflict)
+  command: >-
+    k3s kubectl -n {{ caddy_namespace }} patch deployment caddy --type=json
+    -p=[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]
+  register: caddy_remove_legacy_node_selector
+  failed_when: false
+  changed_when: caddy_remove_legacy_node_selector.rc == 0
+
+- name: Wait for Caddy pods
+  command: k3s kubectl wait --for=condition=Ready pods -l app=caddy -n {{ caddy_namespace }} --timeout=120s
+  retries: 3
+  delay: 5
+  changed_when: false

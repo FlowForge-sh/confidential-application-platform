@@ -1,0 +1,84 @@
+---
+# Tetragon: eBPF observability on all nodes. Deploy from primary master (Helm + kubectl).
+# Requires KUBECONFIG on the target host (e.g. masters[0]).
+
+- name: Check API is reachable
+  command: k3s kubectl get ns default -o name
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: tetragon_api_check
+  changed_when: false
+
+- name: Add Cilium Helm repo (Tetragon chart)
+  command: helm repo add cilium {{ tetragon_helm_repo }}
+  register: tetragon_helm_repo_add
+  failed_when: tetragon_helm_repo_add.rc != 0 and 'already exists' not in (tetragon_helm_repo_add.stderr | default(''))
+  changed_when: tetragon_helm_repo_add.rc == 0
+
+- name: Update Helm repos
+  command: helm repo update
+  changed_when: false
+
+- name: Ensure namespace exists
+  command: k3s kubectl create namespace {{ tetragon_namespace }}
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: tetragon_ns_create
+  failed_when: false
+  changed_when: tetragon_ns_create.rc == 0
+
+- name: Render Tetragon Helm values
+  template:
+    src: values.yaml.j2
+    dest: /tmp/tetragon-values.yaml
+    mode: '0644'
+
+- name: Install or upgrade Tetragon
+  command: >
+    helm upgrade --install {{ tetragon_release_name }} cilium/tetragon
+    --version {{ tetragon_chart_version }}
+    --namespace {{ tetragon_namespace }}
+    --values /tmp/tetragon-values.yaml
+    --wait
+    --timeout 600s
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: tetragon_helm_result
+
+- name: Wait for Tetragon DaemonSet rollout
+  command: k3s kubectl rollout status daemonset/tetragon -n {{ tetragon_namespace }} --timeout=300s
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+- name: Apply observability TracingPolicies
+  include_tasks: policies.yml
+  when: tetragon_apply_observability_policies | default(true)
+
+# --- tetra CLI (control node only; role is run on masters[0]) ---
+- name: Set tetra CLI download arch
+  set_fact:
+    tetragon_tetra_arch: "{{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}"
+
+- name: Download tetra CLI tarball
+  get_url:
+    url: "https://github.com/cilium/tetragon/releases/download/{{ tetragon_tetra_cli_version }}/tetra-linux-{{ tetragon_tetra_arch }}.tar.gz"
+    dest: /tmp/tetra-linux-{{ tetragon_tetra_arch }}.tar.gz
+    mode: '0644'
+  register: tetra_download
+
+- name: Install tetra CLI to /usr/local/bin
+  unarchive:
+    src: /tmp/tetra-linux-{{ tetragon_tetra_arch }}.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+
+- name: Remove tetra CLI tarball
+  file:
+    path: /tmp/tetra-linux-{{ tetragon_tetra_arch }}.tar.gz
+    state: absent
+
+- name: Verify tetra CLI
+  command: /usr/local/bin/tetra version
+  register: tetra_version
+  changed_when: false
+  failed_when: tetra_version.rc != 0

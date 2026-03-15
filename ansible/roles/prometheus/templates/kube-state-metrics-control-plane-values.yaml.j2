@@ -1,0 +1,26 @@
+# kube-state-metrics on control-plane only; use local K8s API (avoids 10.43.0.1 dial timeout).
+fullnameOverride: kube-state-metrics-master
+
+# Single replica: only one control-plane node, so avoid a second Pending pod.
+replicas: 1
+
+nodeSelector:
+  node-role.kubernetes.io/control-plane: "true"
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: node-role.kubernetes.io/master
+    operator: Exists
+    effect: NoSchedule
+
+# So the pod can reach 127.0.0.1:6443 for the API.
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
+
+# Use local K8s API instead of in-cluster (10.43.0.1).
+env:
+  - name: KUBERNETES_SERVICE_HOST
+    value: "{{ prometheus_kube_state_metrics_k8s_api_host }}"
+  - name: KUBERNETES_SERVICE_PORT
+    value: "{{ prometheus_kube_state_metrics_k8s_api_port }}"

@@ -1,0 +1,251 @@
+---
+# Trustee Operator - manages Trustee (KBS) for CoCo attestation
+# https://github.com/confidential-containers/trustee-operator
+
+- name: Ensure git is installed
+  apt:
+    name: git
+    state: present
+    update_cache: true
+  when: ansible_os_family == "Debian"
+
+- name: Ensure git is installed (RedHat)
+  yum:
+    name: git
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Create clone directory
+  file:
+    path: "{{ trustee_operator_clone_path }}"
+    state: directory
+    mode: '0755'
+
+- name: Clone trustee-operator repository
+  git:
+    repo: "{{ trustee_operator_repo_url }}"
+    dest: "{{ trustee_operator_clone_path }}"
+    version: "{{ trustee_operator_version }}"
+    depth: 1
+    force: true
+  register: trustee_clone
+
+- name: Set trustee operator image in kustomization
+  replace:
+    path: "{{ trustee_operator_clone_path }}/config/manager/kustomization.yaml"
+    regexp: 'newTag: .+'
+    replace: "newTag: {{ trustee_operator_image_tag }}"
+  when: trustee_clone is changed or trustee_operator_image_tag != 'v0.5.0'
+
+- name: Install trustee-operator (CRDs and controller)
+  shell: k3s kubectl --kubeconfig=/root/.kube/config apply -k {{ trustee_operator_clone_path }}/config/default
+  register: trustee_apply
+  changed_when: "'configured' in trustee_apply.stdout or 'created' in trustee_apply.stdout"
+
+- name: Wait for trustee-operator controller to be ready
+  shell: k3s kubectl --kubeconfig=/root/.kube/config wait --for=condition=ready pod -l control-plane=controller-manager -n {{ trustee_operator_namespace }} --timeout={{ trustee_operator_wait_timeout }}s
+  register: trustee_wait
+  retries: 3
+  until: trustee_wait.rc == 0
+  delay: 20
+  changed_when: false
+  ignore_errors: true
+  # Idempotent: playbook continues if controller never becomes ready (e.g. image pull / startup issues).
+
+- name: Warn when trustee-operator controller is not ready (playbook continues)
+  debug:
+    msg: "Trustee operator controller pod did not become ready in {{ trustee_operator_namespace }}. Check 'kubectl get pods -n {{ trustee_operator_namespace }}' and image pull. Playbook continues."
+  when: trustee_wait.rc is defined and trustee_wait.rc != 0
+
+- name: Display trustee-operator status (when controller is ready)
+  debug:
+    msg: "Trustee operator is running in {{ trustee_operator_namespace }}. Deploying production Trustee (KBS) for CoCo attestation."
+  when: trustee_wait.rc is defined and trustee_wait.rc == 0
+
+- name: Ensure OpenSSL is installed (for KBS auth keys)
+  apt:
+    name: openssl
+    state: present
+    update_cache: true
+  when: ansible_os_family == "Debian"
+
+- name: Ensure OpenSSL is installed (RedHat)
+  yum:
+    name: openssl
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Set KBS config directory (trustee-operator repo microservices sample)
+  set_fact:
+    trustee_kbs_sample_dir: "{{ trustee_operator_clone_path }}/config/samples/{{ trustee_kbs_deployment_mode }}"
+
+- name: Generate KBS auth key (Ed25519) for production attestation
+  command: "openssl genpkey -algorithm ed25519 -out {{ trustee_kbs_sample_dir }}/privateKey"
+  args:
+    creates: "{{ trustee_kbs_sample_dir }}/privateKey"
+
+- name: Generate KBS auth public key
+  command: "openssl pkey -in {{ trustee_kbs_sample_dir }}/privateKey -pubout -out {{ trustee_kbs_sample_dir }}/kbs.pem"
+  args:
+    creates: "{{ trustee_kbs_sample_dir }}/kbs.pem"
+
+- name: Deploy production Trustee (KBS) – ConfigMaps, Secrets, KbsConfig
+  shell: k3s kubectl --kubeconfig=/root/.kube/config apply -k {{ trustee_kbs_sample_dir }}
+  register: trustee_kbs_apply
+  changed_when: "'configured' in trustee_kbs_apply.stdout or 'created' in trustee_kbs_apply.stdout"
+
+- name: Ensure rendered Trustee manifest directory exists
+  file:
+    path: "{{ trustee_operator_clone_path }}/rendered"
+    state: directory
+    mode: '0755'
+
+- name: Render compatible attestation policy
+  template:
+    src: attestation-policy.yaml.j2
+    dest: "{{ trustee_operator_clone_path }}/rendered/attestation-policy.yaml"
+
+- name: Apply compatible attestation policy
+  shell: k3s kubectl --kubeconfig=/root/.kube/config apply -f {{ trustee_operator_clone_path }}/rendered/attestation-policy.yaml
+  register: trustee_kbs_attestation_policy_apply
+  changed_when: "'configured' in trustee_kbs_attestation_policy_apply.stdout or 'created' in trustee_kbs_attestation_policy_apply.stdout"
+
+- name: Validate resource bindings are configured (fail-closed)
+  assert:
+    that:
+      - trustee_kbs_resource_bindings is mapping
+      - trustee_kbs_resource_bindings | length > 0
+    fail_msg: >-
+      trustee_kbs_resource_bindings is empty. Refusing to apply resource-policy
+      because this would deny all key releases and break secure-pv bootstrap.
+
+- name: Render strict resource policy
+  template:
+    src: resource-policy.yaml.j2
+    dest: "{{ trustee_operator_clone_path }}/rendered/resource-policy.yaml"
+
+- name: Validate rendered resource policy is not empty
+  shell: |
+    set -euo pipefail
+    python3 - <<'PY' "{{ trustee_operator_clone_path }}/rendered/resource-policy.yaml"
+    import re
+    import sys
+
+    path = sys.argv[1]
+    text = open(path, "r", encoding="utf-8").read()
+    if re.search(r"resource_bindings\s*:=\s*\{\s*\}", text, flags=re.S):
+        raise SystemExit("rendered resource-policy has empty resource_bindings")
+    if not re.search(r'"[^"]+"\s*:\s*\{\s*"repository"\s*:', text, flags=re.S):
+        raise SystemExit("rendered resource-policy has no concrete bindings")
+    print("resource-policy render contains concrete bindings")
+    PY
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Apply strict resource policy
+  shell: k3s kubectl --kubeconfig=/root/.kube/config apply -f {{ trustee_operator_clone_path }}/rendered/resource-policy.yaml
+  register: trustee_kbs_resource_policy_apply
+  changed_when: "'configured' in trustee_kbs_resource_policy_apply.stdout or 'created' in trustee_kbs_resource_policy_apply.stdout"
+
+- name: Validate live resource policy is not empty
+  shell: |
+    set -euo pipefail
+    policy="$(k3s kubectl --kubeconfig=/root/.kube/config -n {{ trustee_operator_namespace }} get configmap resource-policy -o jsonpath='{.data.policy\.rego}')"
+    python3 - <<'PY' "$policy"
+    import re
+    import sys
+
+    text = sys.argv[1]
+    if re.search(r"resource_bindings\s*:=\s*\{\s*\}", text, flags=re.S):
+        raise SystemExit("live resource-policy has empty resource_bindings")
+    if not re.search(r'"[^"]+"\s*:\s*\{\s*"repository"\s*:', text, flags=re.S):
+        raise SystemExit("live resource-policy has no concrete bindings")
+    print("live resource-policy contains concrete bindings")
+    PY
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Get existing KBS secret names
+  shell: >
+    k3s kubectl --kubeconfig=/root/.kube/config -n {{ trustee_operator_namespace }}
+    get secrets -o json
+  register: trustee_existing_kbs_secrets
+  changed_when: false
+  when: trustee_kbs_storage_secrets | length > 0
+
+- name: Cache existing KBS secret names
+  set_fact:
+    trustee_existing_kbs_secret_names: "{{ ((trustee_existing_kbs_secrets.stdout | from_json)['items']) | map(attribute='metadata.name') | list }}"
+  when: trustee_kbs_storage_secrets | length > 0
+
+- name: Validate KBS storage seed inputs (fail-closed)
+  assert:
+    that:
+      - "(seed == '' and (item.key in trustee_existing_kbs_secret_names)) or (seed is match('^[0-9a-fA-F]{64}$'))"
+    fail_msg: >-
+      Missing/invalid workload-secret-seed for {{ item.key }}.
+      Provide a 64-hex seed via Ansible Vault or secure environment, or ensure
+      Secret {{ item.key }} already exists in {{ trustee_operator_namespace }}.
+  vars:
+    seed: "{{ item.value['workload-secret-seed'] | default('') }}"
+  loop: "{{ trustee_kbs_storage_secrets | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: trustee_kbs_storage_secrets | length > 0
+  no_log: true
+
+- name: Render KBS storage secret manifests
+  set_fact:
+    trustee_kbs_storage_secret_manifests: "{{ lookup('template', 'kbs-storage-secrets.yaml.j2') }}"
+  when: trustee_kbs_storage_secrets | length > 0
+
+- name: Manage KBS storage secret manifests
+  when:
+    - trustee_kbs_storage_secrets | length > 0
+    - trustee_kbs_storage_secret_manifests | trim | length > 0
+  shell: k3s kubectl --kubeconfig=/root/.kube/config apply -f -
+  args:
+    stdin: "{{ trustee_kbs_storage_secret_manifests }}"
+  register: trustee_kbs_storage_secret_apply
+  changed_when: "'configured' in trustee_kbs_storage_secret_apply.stdout or 'created' in trustee_kbs_storage_secret_apply.stdout"
+  no_log: true
+
+- name: Build effective KBS secret resource list
+  set_fact:
+    trustee_kbs_effective_secret_resources: "{{ (trustee_kbs_secret_resources + (trustee_kbs_storage_secrets.keys() | list)) | unique }}"
+
+- name: Patch KbsConfig secret resources
+  shell: >
+    k3s kubectl --kubeconfig=/root/.kube/config -n {{ trustee_operator_namespace }}
+    patch kbsconfig kbsconfig-sample --type merge
+    -p '{{ {"spec": {"kbsSecretResources": trustee_kbs_effective_secret_resources}} | to_json }}'
+  register: trustee_kbs_patch_resources
+  changed_when: "'patched' in trustee_kbs_patch_resources.stdout or 'configured' in trustee_kbs_patch_resources.stdout"
+
+- name: Restart Trustee deployment to pick up policy/resource changes
+  shell: k3s kubectl --kubeconfig=/root/.kube/config -n {{ trustee_operator_namespace }} rollout restart deployment/trustee-deployment
+  changed_when: true
+
+- name: Wait for Trustee (KBS) deployment to be ready
+  shell: k3s kubectl --kubeconfig=/root/.kube/config wait --for=condition=ready pod -l app=kbs -n {{ trustee_operator_namespace }} --timeout={{ trustee_kbs_wait_timeout | default(300) }}s
+  register: trustee_kbs_wait
+  retries: 3
+  until: trustee_kbs_wait.rc == 0
+  delay: 20
+  changed_when: false
+  ignore_errors: true
+
+- name: Display Trustee (KBS) status
+  debug:
+    msg: "Trustee (KBS) is running in {{ trustee_operator_namespace }}. CoCo attestation uses this KBS by default (in-cluster service)."
+
+- name: Show attestation test commands (run from control node)
+  debug:
+    msg:
+      - "Attestation test from control node (master):"
+      - "  kubectl get pods -n {{ trustee_operator_namespace }}"
+      - "  kubectl get kbsconfig -n {{ trustee_operator_namespace }}"
+      - "  kubectl run curl-kbs --rm -it --restart=Never --image=curlimages/curl -- curl -s http://kbs-service.{{ trustee_operator_namespace }}.svc.cluster.local:8080/health"
+      - "See docs/ATTESTATION-TEST.md for full steps."

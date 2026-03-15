@@ -1,0 +1,48 @@
+---
+# Apply source-based firewall via iptables (ANSIBLE-FIREWALL chain). Optional persistence on boot.
+- name: Ensure iptables is present
+  apt:
+    name: iptables
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Deploy iptables rules script
+  template:
+    src: iptables-rules.sh.j2
+    dest: /usr/local/bin/firewall-ansible-iptables.sh
+    mode: "0755"
+
+- name: Apply iptables rules (INPUT policy DROP + ANSIBLE-FIREWALL chain)
+  command: /usr/local/bin/firewall-ansible-iptables.sh
+  changed_when: true
+  when: ansible_os_family == "Debian"
+
+- name: Install systemd unit to re-apply iptables on boot
+  copy:
+    content: |
+      [Unit]
+      Description=Apply Ansible iptables firewall rules
+      After=network-pre.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/firewall-ansible-iptables.sh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/firewall-ansible-iptables.service
+    mode: "0644"
+  when:
+    - ansible_os_family == "Debian"
+    - firewall_iptables_persist | default(true)
+
+- name: Enable and start firewall-ansible-iptables service
+  systemd:
+    name: firewall-ansible-iptables
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - ansible_os_family == "Debian"
+    - firewall_iptables_persist | default(true)

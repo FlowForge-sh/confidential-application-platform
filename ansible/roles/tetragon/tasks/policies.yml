@@ -1,0 +1,40 @@
+---
+# Apply observability TracingPolicies (bundled files + egress template with cluster CIDRs).
+
+- name: Ensure Tetragon policy directory exists on target
+  file:
+    path: /tmp/tetragon-policies
+    state: directory
+    mode: '0755'
+
+- name: Copy policy library YAMLs to target
+  copy:
+    src: "policylibrary/{{ item }}"
+    dest: "/tmp/tetragon-policies/{{ item }}"
+    mode: '0644'
+  loop:
+    - privileges-raise.yaml
+    - bpf.yaml
+    - modules.yaml
+    - library.yaml
+  loop_control:
+    label: "{{ item }}"
+
+- name: Render egress TracingPolicy with cluster CIDRs
+  template:
+    src: egress.yaml.j2
+    dest: /tmp/tetragon-policies/egress.yaml
+    mode: '0644'
+
+- name: Remove incompatible sshd.yaml from policy dir if present
+  file:
+    path: /tmp/tetragon-policies/sshd.yaml
+    state: absent
+  failed_when: false
+
+- name: Apply all TracingPolicies
+  command: k3s kubectl apply -f /tmp/tetragon-policies/
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: tetragon_apply_policies
+  changed_when: tetragon_apply_policies.rc == 0

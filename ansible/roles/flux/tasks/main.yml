@@ -1,0 +1,164 @@
+---
+# Flux CD: install CLI, install controllers, optionally create SOPS/age secret for Kustomize+SOPS.
+
+- name: Ensure KUBECONFIG is set for Flux (k3s on master)
+  set_fact:
+    flux_kubeconfig: "/root/.kube/config"
+
+- name: Check if Flux CLI is installed
+  command: which flux
+  register: flux_cli_check
+  failed_when: false
+  changed_when: false
+
+- name: Set Flux CLI architecture
+  set_fact:
+    flux_cli_arch: "{{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}"
+
+- name: Download Flux CLI (Linux)
+  get_url:
+    url: "https://github.com/fluxcd/flux2/releases/download/v{{ flux_version }}/flux_{{ flux_version }}_linux_{{ flux_cli_arch }}.tar.gz"
+    dest: /tmp/flux-cli.tar.gz
+    mode: "0644"
+  when: flux_cli_check.rc != 0
+
+- name: Unarchive Flux CLI to /usr/local/bin
+  unarchive:
+    src: /tmp/flux-cli.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    creates: /usr/local/bin/flux
+  when: flux_cli_check.rc != 0
+
+- name: Verify Flux CLI version
+  command: flux --version
+  register: flux_version_out
+  changed_when: false
+
+- name: Display Flux CLI version
+  debug:
+    msg: "{{ flux_version_out.stdout }}"
+
+- name: Install Flux controllers (flux-system)
+  command: flux install --namespace {{ flux_namespace }}
+  environment:
+    KUBECONFIG: "{{ flux_kubeconfig }}"
+  when: flux_install_controllers | default(true)
+
+- name: Wait for Flux controller deployments to be ready
+  command: "k3s kubectl --kubeconfig={{ flux_kubeconfig }} rollout status deployment -n {{ flux_namespace }} --timeout=120s"
+  when: flux_install_controllers | default(true)
+
+- name: Resolve SOPS age key content from file (path on master)
+  slurp:
+    src: "{{ flux_sops_age_key_path }}"
+  register: flux_age_key_slurp
+  when:
+    - (flux_sops_age_key_content | default('') | trim) == ''
+    - flux_sops_age_key_path | default('') | trim != ''
+  run_once: true
+
+- name: Set SOPS age key content from file
+  set_fact:
+    flux_sops_age_key_content: "{{ flux_age_key_slurp.content | b64decode | trim }}"
+  when:
+    - flux_sops_age_key_path | default('') | trim != ''
+    - flux_age_key_slurp is defined
+    - flux_age_key_slurp.content is defined
+  run_once: true
+
+- name: Create SOPS age decryption secret in flux-system
+  block:
+    - name: Ensure flux-system namespace exists (for secret)
+      command: "k3s kubectl --kubeconfig={{ flux_kubeconfig }} create namespace {{ flux_namespace }}"
+      register: flux_ns_create
+      failed_when: false
+      changed_when: "'Created' in flux_ns_create.stdout"
+
+    # Secret key must be *.agekey for Flux kustomize-controller to recognize it as age
+    - name: Create sops-age Secret for Kustomize SOPS decryption
+      command: >
+        k3s kubectl --kubeconfig={{ flux_kubeconfig }} create secret generic {{ flux_sops_age_secret_name }}
+        --namespace {{ flux_namespace }}
+        --from-literal=age.agekey={{ flux_sops_age_key_content }}
+        --dry-run=client -o yaml
+      register: flux_sops_secret_yaml
+      changed_when: false
+      no_log: true
+
+    - name: Apply sops-age Secret
+      command: k3s kubectl --kubeconfig={{ flux_kubeconfig }} apply -f -
+      args:
+        stdin: "{{ flux_sops_secret_yaml.stdout }}"
+      no_log: true
+  when:
+    - flux_sops_age_key_content | default('') | trim != ''
+    - flux_install_controllers | default(true)
+
+- name: Apply GitRepository for manifests repo
+  template:
+    src: gitrepository.yaml.j2
+    dest: /tmp/flux-gitrepository.yaml
+  when:
+    - flux_manifests_repo_url | default('') | trim != ''
+    - flux_install_controllers | default(true)
+
+- name: Apply GitRepository to cluster
+  command: k3s kubectl --kubeconfig={{ flux_kubeconfig }} apply -f /tmp/flux-gitrepository.yaml
+  when:
+    - flux_manifests_repo_url | default('') | trim != ''
+    - flux_install_controllers | default(true)
+
+- name: Apply Kustomization for manifests repo (with SOPS decryption)
+  template:
+    src: kustomization.yaml.j2
+    dest: /tmp/flux-kustomization.yaml
+  when:
+    - flux_manifests_repo_url | default('') | trim != ''
+    - flux_install_controllers | default(true)
+
+- name: Apply Kustomization to cluster
+  command: k3s kubectl --kubeconfig={{ flux_kubeconfig }} apply -f /tmp/flux-kustomization.yaml
+  when:
+    - flux_manifests_repo_url | default('') | trim != ''
+    - flux_install_controllers | default(true)
+
+- name: Deploy Flux UI (Capacitor)
+  template:
+    src: capacitor-oci.yaml.j2
+    dest: /tmp/flux-capacitor.yaml
+  when: flux_ui_enabled | default(false)
+
+- name: Apply Capacitor OCIRepository and Kustomization
+  command: k3s kubectl --kubeconfig={{ flux_kubeconfig }} apply -f /tmp/flux-capacitor.yaml
+  when: flux_ui_enabled | default(false)
+
+- name: Allow Caddy to reach Capacitor (NetworkPolicy)
+  template:
+    src: networkpolicy-caddy-capacitor.yaml.j2
+    dest: /tmp/flux-networkpolicy-caddy-capacitor.yaml
+  when: flux_ui_enabled | default(false)
+
+- name: Apply NetworkPolicy allow-caddy-to-capacitor
+  command: k3s kubectl --kubeconfig={{ flux_kubeconfig }} apply -f /tmp/flux-networkpolicy-caddy-capacitor.yaml
+  when: flux_ui_enabled | default(false)
+
+- name: Show Flux status
+  command: flux check --kubeconfig={{ flux_kubeconfig }}
+  register: flux_check
+  changed_when: false
+  failed_when: false
+  when: flux_install_controllers | default(true)
+
+- name: Display Flux check result
+  debug:
+    msg: "{{ flux_check.stdout_lines }}"
+  when: flux_install_controllers | default(true) and flux_check is defined
+
+- name: Remind about GitRepository and Kustomization
+  debug:
+    msg:
+      - "Flux controllers and (if configured) GitRepository + Kustomization are in {{ flux_namespace }}."
+      - "Set flux_manifests_repo_url in group_vars and provide flux_sops_age_key_file so SOPS decryption works."
+      - "Flux UI (Capacitor): kubectl port-forward -n {{ flux_namespace }} svc/capacitor 9000:9000 then open http://localhost:9000"
+  when: flux_install_controllers | default(true)

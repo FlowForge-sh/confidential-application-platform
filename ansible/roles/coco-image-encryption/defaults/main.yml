@@ -1,0 +1,6 @@
+---
+# Default KBS URL for CoCo image encryption (Trustee in trustee-operator-system)
+# Must match the Trustee (KBS) service deployed by trustee-operator role
+coco_kbs_default_url: "http://kbs-service.trustee-operator-system.svc.cluster.local:8080"
+coco_kata_config_d_dir: "/opt/kata/share/defaults/kata-containers/config.d"
+coco_kbs_config_fragment_name: "10-coco-kbs-default.toml"

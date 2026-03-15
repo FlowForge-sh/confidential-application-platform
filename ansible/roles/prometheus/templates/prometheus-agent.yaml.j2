@@ -1,0 +1,81 @@
+---
+# Prometheus Agent: scrape + remote write only, no local TSDB (no retention on cluster).
+# References Secret below for additional scrape configs (kubelet, cAdvisor).
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata:
+  name: {{ prometheus_cr_name }}
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: prometheus-agent
+spec:
+  serviceAccountName: prometheus
+  replicas: 1
+  serviceMonitorSelector: {}
+  serviceMonitorNamespaceSelector: {}
+  podMonitorSelector: {}
+  podMonitorNamespaceSelector: {}
+  resources:
+    requests:
+      memory: "400Mi"
+      cpu: "100m"
+  remoteWrite:
+    - url: "{{ prometheus_remote_write_url }}"
+      basicAuth:
+        username:
+          name: {{ prometheus_remote_write_secret_name }}
+          key: username
+        password:
+          name: {{ prometheus_remote_write_secret_name }}
+          key: password
+  additionalScrapeConfigs:
+    name: prometheus-additional-scrape-configs
+    key: additional-scrape-configs.yaml
+---
+# Additional scrape configs (kubelet metrics + cAdvisor). Mounted by the Agent above.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prometheus-additional-scrape-configs
+  namespace: {{ prometheus_namespace }}
+type: Opaque
+stringData:
+  additional-scrape-configs.yaml: |
+    - job_name: kubelet
+      honor_labels: true
+      metrics_path: /metrics
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+        - role: node
+      relabel_configs:
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+        - source_labels: [__meta_kubernetes_node_address_InternalIP]
+          target_label: __address__
+          replacement: ${1}:10250
+        - replacement: kubelet
+          target_label: job
+    - job_name: kubelet-cadvisor
+      honor_labels: true
+      metrics_path: /metrics/cadvisor
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+        - role: node
+      relabel_configs:
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+        - source_labels: [__meta_kubernetes_node_address_InternalIP]
+          target_label: __address__
+          replacement: ${1}:10250
+        - replacement: kubelet-cadvisor
+          target_label: job

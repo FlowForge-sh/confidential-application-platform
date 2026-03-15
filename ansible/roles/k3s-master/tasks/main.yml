@@ -1,0 +1,257 @@
+---
+- name: Check if K3s is already installed
+  stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Get installed K3s version
+  command: k3s --version
+  register: installed_k3s_version
+  when: k3s_binary.stat.exists
+  changed_when: false
+  failed_when: false
+
+- name: Display K3s installation status
+  debug:
+    msg: "K3s is {{ 'already installed: ' + installed_k3s_version.stdout if k3s_binary.stat.exists else 'not installed' }}"
+
+- name: Ensure K3s config directory exists
+  file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: '0755'
+
+- name: Create K3s config file
+  template:
+    src: k3s-server-config.yaml.j2
+    dest: /etc/rancher/k3s/config.yaml
+    mode: '0600'
+  register: k3s_config_result
+
+- name: Create Pod Security admission config
+  template:
+    src: pod-security-admission.yaml.j2
+    dest: "{{ k3s_pod_security_admission_config_path }}"
+    mode: '0600'
+  register: k3s_pod_security_config_result
+
+- name: Download K3s installation script
+  get_url:
+    url: "{{ k3s_install_url }}"
+    dest: /tmp/k3s-install.sh
+    mode: '0755'
+
+# Install binary and systemd unit but do not start (per docs: config file is independent of install script).
+# We start the service ourselves after adding systemd TimeoutStartSec so bootstrap reconciliation can complete.
+- name: Install K3s server (primary master) – binary and service only, do not start
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: "server --cluster-init"
+    INSTALL_K3S_SKIP_START: "true"
+    K3S_TOKEN: "{{ k3s_token | default(lookup('password', '/tmp/k3s-token chars=ascii_letters,digits length=32')) }}"
+  shell: /tmp/k3s-install.sh
+  when: is_primary | default(false) and not (k3s_binary.stat.exists | default(false))
+  register: k3s_install_primary
+
+- name: Install K3s server (additional masters) – binary and service only, do not start
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: "server --server https://{{ hostvars[groups['masters'][0]]['private_ip'] | default(hostvars[groups['masters'][0]]['ansible_host']) }}:6443"
+    INSTALL_K3S_SKIP_START: "true"
+    K3S_TOKEN: "{{ k3s_token | default(lookup('password', '/tmp/k3s-token chars=ascii_letters,digits length=32')) }}"
+  shell: /tmp/k3s-install.sh
+  when: not (is_primary | default(false)) and (master_count | default(1) | int) > 1 and not (k3s_binary.stat.exists | default(false))
+  register: k3s_install_secondary
+
+# If using private_ip, ensure the address is on the node so etcd/API can bind (avoids bind failure on startup).
+- name: Wait for private IP to be present on the node (private-only)
+  shell: ip -4 addr show | grep -q "{{ private_ip }}"
+  args:
+    executable: /bin/bash
+  register: private_ip_check
+  retries: 12
+  delay: 5
+  until: private_ip_check.rc == 0
+  when: private_ip is defined and private_ip != ansible_host
+
+# Per K3s docs: bootstrap reconciliation (etcd tmp -> main) can take time; extend systemd start timeout
+- name: Ensure k3s systemd drop-in directory exists
+  file:
+    path: /etc/systemd/system/k3s.service.d
+    state: directory
+    mode: '0755'
+
+# K3s uses Type=notify; it notifies systemd only when readyz passes. If it never passes (e.g. etcd/bootstrap
+# issue), systemd will kill after TimeoutStartSec. Default unit has Restart=always, RestartSec=5s → tight restart loop.
+# Use a longer RestartSec so the process isn't restarted every 5s (gives time to inspect logs and for etcd to settle).
+- name: Set systemd start timeout and restart delay for K3s
+  copy:
+    dest: /etc/systemd/system/k3s.service.d/timeout.conf
+    content: |
+      [Service]
+      TimeoutStartSec=600
+      RestartSec=30
+    mode: '0644'
+
+- name: Enable and start K3s service
+  systemd:
+    name: k3s
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Restart K3s to apply config or registries change
+  systemd:
+    name: k3s
+    state: restarted
+  when:
+    - k3s_binary.stat.exists | default(false)
+    - k3s_config_result is changed or k3s_pod_security_config_result is changed
+
+# K3s writes k3s.yaml when the API is up; wait for it so we can patch before "Wait for K3s to be ready".
+- name: Wait for kubeconfig to be written by K3s
+  wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    state: present
+    timeout: 300
+
+# bind-address 0.0.0.0 causes K3s to write server: https://0.0.0.0:6443 (not connectable). Patch to a connectable address.
+- name: Patch kubeconfig server to private IP (private-only networking)
+  replace:
+    path: /etc/rancher/k3s/k3s.yaml
+    regexp: 'https://(127\.0\.0\.1|0\.0\.0\.0):6443'
+    replace: 'https://{{ private_ip }}:6443'
+  when: private_ip is defined and private_ip != ansible_host
+
+- name: Patch kubeconfig server 0.0.0.0 to 127.0.0.1 (non–private-only)
+  replace:
+    path: /etc/rancher/k3s/k3s.yaml
+    regexp: 'https://0\.0\.0\.0:6443'
+    replace: 'https://127.0.0.1:6443'
+  when: private_ip is not defined or private_ip == ansible_host
+
+# K3s overwrites k3s.yaml on (re)start with server: 0.0.0.0. Use a stable copy for ready-check so retries work.
+- name: Create kubeconfig directory for root (before ready check)
+  file:
+    path: /root/.kube
+    state: directory
+    mode: '0700'
+
+- name: Copy kubeconfig to root (stable copy for ready check)
+  copy:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: /root/.kube/config
+    remote_src: yes
+    mode: '0600'
+
+- name: Patch root kubeconfig server to private IP (private-only, for ready check)
+  replace:
+    path: /root/.kube/config
+    regexp: 'https://(127\.0\.0\.1|0\.0\.0\.0):6443'
+    replace: 'https://{{ private_ip }}:6443'
+  when: private_ip is defined and private_ip != ansible_host
+
+- name: Patch root kubeconfig server 0.0.0.0 to 127.0.0.1 (non–private-only, for ready check)
+  replace:
+    path: /root/.kube/config
+    regexp: 'https://0\.0\.0\.0:6443'
+    replace: 'https://127.0.0.1:6443'
+  when: private_ip is not defined or private_ip == ansible_host
+
+# Use --kubeconfig explicitly: 'k3s kubectl' may ignore KUBECONFIG and use /etc/rancher/k3s/k3s.yaml (which can have server: 0.0.0.0 or be overwritten), leading to connection refused to localhost:8080.
+- name: Wait for K3s to be ready
+  command: k3s kubectl --kubeconfig=/root/.kube/config get nodes
+  register: k3s_ready
+  retries: 60
+  delay: 15
+  until: k3s_ready.rc == 0
+  changed_when: false
+
+# K3s may overwrite k3s.yaml when API becomes ready; patch again so k3s kubectl and copy use correct server.
+- name: Re-patch kubeconfig server after K3s ready (private-only)
+  replace:
+    path: /etc/rancher/k3s/k3s.yaml
+    regexp: 'https://(127\.0\.0\.1|0\.0\.0\.0):6443'
+    replace: 'https://{{ private_ip }}:6443'
+  when: private_ip is defined and private_ip != ansible_host
+
+- name: Re-patch kubeconfig server 0.0.0.0 to 127.0.0.1 after K3s ready (non–private-only)
+  replace:
+    path: /etc/rancher/k3s/k3s.yaml
+    regexp: 'https://0\.0\.0\.0:6443'
+    replace: 'https://127.0.0.1:6443'
+  when: private_ip is not defined or private_ip == ansible_host
+
+# Re-patch root kubeconfig in case it was overwritten by a later copy from k3s.yaml (idempotent).
+- name: Re-patch root kubeconfig server after K3s ready (private-only)
+  replace:
+    path: /root/.kube/config
+    regexp: 'https://(127\.0\.0\.1|0\.0\.0\.0):6443'
+    replace: 'https://{{ private_ip }}:6443'
+  when: private_ip is defined and private_ip != ansible_host
+
+- name: Re-patch root kubeconfig server after K3s ready (non–private-only)
+  replace:
+    path: /root/.kube/config
+    regexp: 'https://0\.0\.0\.0:6443'
+    replace: 'https://127.0.0.1:6443'
+  when: private_ip is not defined or private_ip == ansible_host
+
+- name: Set KUBECONFIG environment variable (use patched root config so kubectl works)
+  lineinfile:
+    path: /root/.bashrc
+    line: 'export KUBECONFIG=/root/.kube/config'
+    create: yes
+
+- name: Get K3s node token
+  slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: k3s_node_token
+  when: is_primary | default(false)
+
+- name: Display K3s token
+  debug:
+    msg: "K3s cluster token: {{ k3s_node_token.content | b64decode | trim }}"
+  when: is_primary | default(false)
+
+- name: Wait for kube-system pods
+  command: k3s kubectl --kubeconfig=/root/.kube/config get pods -n kube-system -o json
+  register: kube_system_pods
+  retries: 30
+  delay: 10
+  until: kube_system_pods.rc == 0
+  changed_when: false
+
+# Verify control plane is registered and reachable via the K8s API.
+# Node will be NotReady until Cilium (or another CNI) is installed (we use flannel-backend: none).
+- name: Verify control plane node is registered
+  command: k3s kubectl --kubeconfig=/root/.kube/config get nodes -o json
+  register: k3s_nodes_json
+  changed_when: false
+
+- name: Set cluster nodes fact from API
+  set_fact:
+    k3s_nodes_list: "{{ (k3s_nodes_json.stdout | from_json)['items'] | default([]) }}"
+
+- name: Assert at least one node (control plane) is registered
+  assert:
+    that:
+      - k3s_nodes_list | length >= 1
+    fail_msg: "Control plane node is not registered; check K3s service and API."
+    success_msg: "Control plane node is registered (Ready after Cilium is installed)."
+
+- name: Display registered nodes (control plane)
+  debug:
+    msg: "Nodes registered: {{ k3s_nodes_list | map(attribute='metadata.name') | list }}"
+
+- name: Install kubectl aliases
+  blockinfile:
+    path: /root/.bashrc
+    block: |
+      alias k='kubectl'
+      alias kgp='kubectl get pods'
+      alias kgs='kubectl get svc'
+      alias kgn='kubectl get nodes'
+      source <(kubectl completion bash)
+    create: yes
+    marker: "# {mark} KUBECTL ALIASES"

@@ -1,0 +1,27 @@
+---
+# Headlamp: Kubernetes management UI. Expose via Caddy with basic auth.
+# Chart: https://github.com/kubernetes-sigs/headlamp/tree/main/charts/headlamp
+headlamp_namespace: headlamp
+headlamp_release_name: headlamp
+headlamp_chart_version: "0.40.0"
+headlamp_helm_repo: https://kubernetes-sigs.github.io/headlamp/
+headlamp_in_cluster: true
+headlamp_ingress_enabled: false
+# Base URL path for Headlamp UI (empty = /). Auto-login uses /internal-login (internal IPs only).
+headlamp_base_url: ""
+# Session TTL (seconds) for token cookie; default 7 days.
+headlamp_session_ttl: 604800
+# Watch plugins dir for changes (reload when plugins are updated).
+headlamp_watch_plugins: true
+# Auto-login: /internal-login (internal IPs only) sets cluster token then redirects to /. Not exposed to public.
+headlamp_auto_login_enabled: true
+# When true, create headlamp-admin ServiceAccount with cluster-admin and use its token for auto-login (full cluster access by default).
+headlamp_admin_sa_enabled: true
+# Extra compatibility binding for stale legacy tokens that may reference kube-system/headlamp-admin.
+headlamp_admin_sa_legacy_kube_system_binding: true
+# Marker cookie value used by Caddy to detect that /internal-login bootstrap already ran.
+headlamp_token_set_cookie_value: "v2"
+# CIDRs that are allowed to access the auto-login page (private + cluster by default).
+headlamp_auto_login_internal_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# In-cluster context name (must match Headlamp config.inClusterContextName).
+headlamp_cluster_name: "main"

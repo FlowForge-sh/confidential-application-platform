@@ -1,0 +1,55 @@
+---
+# Edge Caddy: L4 SNI gateway + optional legacy HTTP/TLS termination for
+# external_caddy_http compatibility. Single deployment, one public IP.
+caddy_namespace: caddy
+# Caddy version used when building the image (passed as Docker build-arg CADDY_VERSION). Override in group_vars/all.yml.
+caddy_version: "2.10.0"
+# caddy-l4 module version (passed as Docker build-arg CADDY_L4_VERSION).
+# Pin to a specific tag/commit for reproducibility. See files/caddy-l4-version.txt.
+caddy_l4_version: "latest"
+# Image built from files/Dockerfile on the control plane and loaded into K3s; no third-party image.
+caddy_image: "caddy-l4-cloudflare:latest"
+caddy_build_image: true   # Set false to skip build (e.g. if image already loaded)
+# Tenant-ingress sidecar image (caddy + cloudflare-dns + cryptsetup). Built from Dockerfile.ingress.
+caddy_ingress_image: "caddy-cloudflare-ingress:latest"
+caddy_build_ingress_image: true  # Set false to skip ingress image build
+caddy_replicas: 1
+# Email for Let's Encrypt ACME account (ops hostnames only)
+caddy_acme_email: "admin@example.com"
+# Legacy edge HTTP routes: list of { host: "fqdn", backend: "http://...", zone: "dns-zone" }.
+# Keep empty when running pure SNI passthrough mode.
+caddy_routes: []
+# Shared ops-ingress (single in-cluster TLS terminator for all ops hosts).
+ops_ingress_enabled: false
+ops_ingress_namespace: enclave-ops
+ops_ingress_name: ops-ingress
+ops_ingress_image: "{{ caddy_ingress_image }}"
+ops_ingress_use_persistent_storage: true
+ops_ingress_storage_class: longhorn
+ops_ingress_storage_size: 2Gi
+# Shared basic auth for all ops hosts served by ops-ingress.
+ops_ingress_basic_auth_enabled: true
+ops_ingress_basic_auth_username: admin
+ops_ingress_basic_auth_password: flowforgeconfidential
+# Prefer a precomputed bcrypt hash to avoid runtime hashing/toolchain issues.
+ops_ingress_basic_auth_password_bcrypt: ""
+# Headlamp auth-gate cookie secret used to avoid repeated browser basic-auth prompts.
+ops_ingress_headlamp_gate_cookie: "change-me"
+# Marker cookie value used to confirm Headlamp /internal-login token bootstrap completed.
+ops_ingress_headlamp_token_set_cookie: "v2"
+# Ops TLS routes served by ops-ingress: list of { host, backend, zone }.
+ops_ingress_routes: []
+# Optional explicit hostname list per zone for single cert issuance.
+ops_ingress_zone_wildcards: {}
+# SNI passthrough routes: list of { host: "fqdn", backend_tls: "svc.ns.svc.cluster.local:443", tenant: "namespace" }.
+# Populated at reload time from ConfigMaps with label caddy-sni-route=true.
+# Define static entries in group_vars/all.yml; dynamic entries come from the cluster.
+sni_routes: []
+# Tenant handle snippets per zone (built from ConfigMaps with label caddy-route=true). Set by role when fetching from cluster.
+caddy_tenant_handles_per_zone: {}
+# Tenant HTTP hosts per zone (built from ConfigMaps with label caddy-route=true).
+caddy_tenant_hosts_per_zone: {}
+# Use emptyDir so deployment can be repeated without PVC/Longhorn on control plane; certs re-requested on restart.
+caddy_use_persistent_storage: false
+# When caddy_use_persistent_storage is true, optional storage class for the PVC
+caddy_data_storage_class: ""  # Use cluster default if empty

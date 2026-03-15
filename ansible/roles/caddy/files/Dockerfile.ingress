@@ -1,0 +1,16 @@
+# Tenant-ingress image: Caddy with Cloudflare DNS (tenant ACME DNS-01) + cryptsetup (secure-pv LUKS).
+# Built on the control plane by the Ansible caddy role (caddy_build_ingress_image: true).
+# This image runs inside the confidential tenant pod as the tenant-ingress sidecar.
+ARG CADDY_VERSION=2.10.0
+FROM caddy:${CADDY_VERSION}-builder AS builder
+
+# cloudflare DNS plugin for ACME DNS-01 (tenant cert issuance inside the SNP pod)
+RUN xcaddy build \
+    --with github.com/caddy-dns/cloudflare@master
+
+FROM caddy:${CADDY_VERSION}-alpine
+
+# cryptsetup + e2fsprogs required by secure-pv bootstrap script for LUKS unlock of tls-state volume
+RUN apk add --no-cache cryptsetup e2fsprogs
+
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

@@ -1,0 +1,24 @@
+# Promtail on worker node(s): same Loki endpoint, default in-cluster K8s API.
+config:
+  clients:
+    - url: {{ loki_remote_write_url }}
+      basic_auth:
+        username: ${LOKI_REMOTE_USERNAME}
+        password: ${LOKI_REMOTE_PASSWORD}
+
+extraArgs:
+  - -config.expand-env=true
+extraEnv:
+  - name: LOKI_REMOTE_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: {{ promtail_remote_write_secret_name }}
+        key: username
+  - name: LOKI_REMOTE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: {{ promtail_remote_write_secret_name }}
+        key: password
+
+# Worker only; control-plane has its own release (promtail-master) with local K8s API.
+tolerations: []

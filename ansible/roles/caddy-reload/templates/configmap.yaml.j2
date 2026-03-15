@@ -1,0 +1,134 @@
+{# Keep in sync with ansible/roles/caddy/templates/configmap.yaml.j2 #}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: caddyfile
+  namespace: "{{ caddy_namespace }}"
+data:
+  Caddyfile: |
+    # Global: ACME email, L4 SNI passthrough for tenant hostnames, trusted proxies.
+    {
+      email {{ caddy_acme_email | quote }}
+      # L4 SNI passthrough: tenant hostnames proxied directly without TLS termination at edge.
+      layer4 {
+        :443 {
+          # BEGIN PLATFORM SNI ROUTES
+{% for r in caddy_sni_routes | default([]) %}
+          @sni_{{ r.host | replace('-', '_') | replace('.', '_') }} tls sni {{ r.host }}
+          route @sni_{{ r.host | replace('-', '_') | replace('.', '_') }} {
+            proxy {{ r.backend_tls }}
+          }
+{% endfor %}
+          # END PLATFORM SNI ROUTES
+        }
+      }
+      servers {
+        trusted_proxies static private_ranges
+      }
+    }
+    # Legacy HTTP route blocks (used by external_caddy_http mode only).
+{% set route_zones = caddy_routes | map(attribute='zone') | list %}
+{% set tenant_zones = (caddy_tenant_hosts_per_zone | default({})) | dict2items | map(attribute='key') | list %}
+{% for zone in (route_zones + tenant_zones) | unique %}
+    {% set route_hosts = caddy_routes | selectattr('zone', 'equalto', zone) | map(attribute='host') | list %}
+    {% set tenant_hosts = (caddy_tenant_hosts_per_zone | default({})).get(zone, []) %}
+    {% set zone_hosts = (route_hosts + tenant_hosts) | unique %}
+    {% set zone_server_names = (caddy_zone_wildcards | default({})).get(zone, zone_hosts | join(' ')) %}
+{% if zone_server_names | trim %}
+    {{ zone_server_names }} {
+      tls {
+        dns cloudflare {env.CF_API_TOKEN_{{ zone | replace('.', '_') | upper }}}
+        resolvers 1.1.1.1
+      }
+      route {
+{% for r in caddy_routes | selectattr('zone', 'equalto', zone) %}
+        {% set host_label = r.host.split('.')[0] %}
+        @{{ r.host | replace('.', '_') | replace('-', '_') }} host {{ r.host }}
+        handle @{{ r.host | replace('.', '_') | replace('-', '_') }} {
+{% if host_label == 'hubble-enclava' and hubble_ui_basic_auth_username is defined and hubble_ui_basic_auth_password is defined %}
+          basic_auth * {
+            {{ hubble_ui_basic_auth_username }} {{ hubble_ui_basic_auth_password | password_hash('bcrypt') }}
+          }
+{% elif host_label == 'longhorn-enclava' and longhorn_ui_basic_auth_username is defined and longhorn_ui_basic_auth_password is defined %}
+          basic_auth * {
+            {{ longhorn_ui_basic_auth_username }} {{ longhorn_ui_basic_auth_password | password_hash('bcrypt') }}
+          }
+{% elif host_label == 'flux-enclava' and flux_ui_basic_auth_username is defined and flux_ui_basic_auth_password is defined %}
+          basic_auth * {
+            {{ flux_ui_basic_auth_username }} {{ flux_ui_basic_auth_password | password_hash('bcrypt') }}
+          }
+{% elif host_label == 'headlamp-enclava' and headlamp_ui_basic_auth_username is defined and headlamp_ui_basic_auth_password is defined %}
+          {% if headlamp_gate_cookie_secret is not defined %}
+          basic_auth * {
+            {{ headlamp_ui_basic_auth_username }} {{ headlamp_ui_basic_auth_password | password_hash('bcrypt') }}
+          }
+          {% endif %}
+          {% if headlamp_gate_cookie_secret is defined %}
+          # Session cookie: after first basic auth we set a cookie so redirects don't re-prompt (browsers drop Authorization on redirect).
+          @headlamp_has_cookie {
+            header_regexp Cookie headlamp_gate={{ headlamp_gate_cookie_secret }}
+          }
+          handle @headlamp_has_cookie {
+            reverse_proxy {{ r.backend }} {
+              header_down -WWW-Authenticate
+              header_down +Cache-Control "private, no-store"
+            }
+          }
+          {% endif %}
+          {% endif %}
+{% if host_label == 'headlamp-enclava' and headlamp_auto_login_enabled | default(false) and headlamp_auto_login_backend is defined and headlamp_auto_login_internal_cidrs is defined %}
+          @headlamp_internal remote_ip {{ headlamp_auto_login_internal_cidrs | join(' ') }}
+          @headlamp_has_token_set header Cookie *headlamp_token_set*
+          @headlamp_internal_root_no_token path / not @headlamp_has_token_set @headlamp_internal
+          handle_path /internal-login* {
+            handle @headlamp_internal {
+              reverse_proxy {{ headlamp_auto_login_backend }}
+            }
+            handle {
+              redir / 302
+            }
+          }
+          handle @headlamp_internal_root_no_token {
+            redir /internal-login 302
+          }
+          handle {
+            {% if headlamp_gate_cookie_secret is defined %}
+            basic_auth * {
+              {{ headlamp_ui_basic_auth_username }} {{ headlamp_ui_basic_auth_password | password_hash('bcrypt') }}
+            }
+            {% endif %}
+            reverse_proxy {{ r.backend }} {
+              header_down -WWW-Authenticate
+              {% if headlamp_gate_cookie_secret is defined %}
+              header_down +Set-Cookie "headlamp_gate={{ headlamp_gate_cookie_secret }}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400"
+              header_down +Cache-Control "private, no-store"
+              {% endif %}
+            }
+          }
+{% else %}
+          {% if host_label == 'headlamp-enclava' and headlamp_gate_cookie_secret is defined %}
+          handle {
+            basic_auth * {
+              {{ headlamp_ui_basic_auth_username }} {{ headlamp_ui_basic_auth_password | password_hash('bcrypt') }}
+            }
+            reverse_proxy {{ r.backend }} {
+              header_down -WWW-Authenticate
+              header_down +Set-Cookie "headlamp_gate={{ headlamp_gate_cookie_secret }}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400"
+              header_down +Cache-Control "private, no-store"
+            }
+          }
+          {% else %}
+          reverse_proxy {{ r.backend }} {
+            header_down -WWW-Authenticate
+          }
+          {% endif %}
+{% endif %}
+        }
+{% endfor %}
+{# Ops HTTP tenant routes managed by platform-api. BEGIN/END markers required by CaddyManager. #}
+    # BEGIN PLATFORM TENANT ROUTES
+{{ (caddy_tenant_handles_per_zone | default({})).get(zone, '') }}    # END PLATFORM TENANT ROUTES
+      }
+    }
+{% endif %}
+{% endfor %}

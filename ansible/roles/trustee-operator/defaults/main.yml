@@ -1,0 +1,110 @@
+---
+# Trustee Operator + production Trustee (KBS) for CoCo attestation
+# https://github.com/confidential-containers/trustee-operator
+# Installs operator and deploys production KBS per repo (microservices mode).
+
+trustee_operator_version: "v0.5.0"
+trustee_operator_image: "quay.io/confidential-containers/trustee-operator"
+trustee_operator_image_tag: "v0.5.0"
+trustee_operator_namespace: trustee-operator-system
+trustee_operator_repo_url: "https://github.com/confidential-containers/trustee-operator.git"
+trustee_operator_clone_path: /tmp/trustee-operator
+trustee_operator_wait_timeout: 120
+
+# Production KBS deployment (per trustee-operator config/samples)
+trustee_kbs_deployment_mode: "microservices"  # microservices | all-in-one
+trustee_kbs_wait_timeout: 180
+
+# Storage resources mounted into KBS repository at /opt/confidential-containers/kbs/repository/default/<resource-name>.
+trustee_kbs_secret_resources:
+  - kbsres1
+  - flowforge-storage
+  - postgresql-demo-storage
+  - redis-demo-storage
+
+# Secure PV workload keys exposed through KBS (resource -> key/value pairs).
+# IMPORTANT:
+#   Do not commit plaintext seeds. Supply via Ansible Vault or secure CI env vars.
+#   Example:
+#     TRUSTEE_FLOWFORGE_STORAGE_SEED=<64-hex>
+#     TRUSTEE_POSTGRESQL_STORAGE_SEED=<64-hex>
+#     TRUSTEE_REDIS_STORAGE_SEED=<64-hex>
+trustee_kbs_storage_secrets:
+  flowforge-storage:
+    workload-secret-seed: "{{ lookup('env', 'TRUSTEE_FLOWFORGE_STORAGE_SEED') | default('', true) }}"
+  postgresql-demo-storage:
+    workload-secret-seed: "{{ lookup('env', 'TRUSTEE_POSTGRESQL_STORAGE_SEED') | default('', true) }}"
+  redis-demo-storage:
+    workload-secret-seed: "{{ lookup('env', 'TRUSTEE_REDIS_STORAGE_SEED') | default('', true) }}"
+
+# Per-resource key release bindings enforced by Trustee resource policy.
+# Enforcement is fail-closed on both:
+#   - requested resource path (repository/resource/tag)
+#   - requester workload identity from attested init-data (image claims and/or init-data hash)
+trustee_kbs_resource_bindings:
+  flowforge-storage:
+    repository: "default"
+    tag: "workload-secret-seed"
+    allowed_images:
+      - "ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561"
+    allowed_namespaces:
+      - "flowforge"
+    allowed_service_accounts:
+      - "flowforge-workload"
+    allowed_init_data_hashes:
+      - "60e963d603eacc7b79b851fc68bcfded2fdfd10cc077f85ec4bda6ba8ef92c79"
+  postgresql-demo-storage:
+    repository: "default"
+    tag: "workload-secret-seed"
+    allowed_images:
+      - "ghcr.io/aljazceru/nutshell-tee@sha256:9ae0bf9a7d93b1da2c6ac7f95ba6935bb60a99b11589286fa10648dfb8f0e7c2"
+    allowed_namespaces:
+      - "postgresql-demo"
+    allowed_service_accounts:
+      - "postgresql-workload"
+    allowed_init_data_hashes:
+      - "2c48bfcbbacea1799c15c340476cedbc1365290734f6281083298b87cc03554c"
+  redis-demo-storage:
+    repository: "default"
+    tag: "workload-secret-seed"
+    allowed_images:
+      - "ghcr.io/aljazceru/nutshell-tee@sha256:14cbd0bca3b3a246234133f6d192adb16095063b9536790ebbe30b88c1ca7f1a"
+    allowed_namespaces:
+      - "redis-demo"
+    allowed_service_accounts:
+      - "redis-workload"
+    allowed_init_data_hashes:
+      - "cd3438a42fcfae5a8af41052e62df1578823e78b57110f44371f96747b7ce9b5"
+
+# SNP attestation allowlists used by attestation-policy ConfigMap.
+# Keep these in sync with approved runtime measurements and platform TCB.
+# If these lists do not match runtime evidence, KBS key release is denied.
+trustee_snp_allowed_measurements:
+  - "c747c3e386f9fef3c47ef01b5f540bfeaa077b83ec4856d8b85084bf3bfbb8b4638c41040c87b81ebd6ae99744d21748"
+  - "6ef5cab9421aec9c4188d046945ba215d6527e171985ab7f72f64093ae685ebbc885959ea8a83be0a3dd959ba2d31e72"
+  - "7b2fd81b71123c0829dd5376dbcff3c46a7430f25f4be76345db2303320ecc3e9cd54dda8015b17113977cd746390b14"
+  # Current flowforge-enclava pod measurement (post-apply); add during measurement rollover if runtime/kernel changed
+  - "f5171c74738ddd20029bb8ecc1d3a49e67e45c798d9185b8794f80756f37a6366ff0e55598b62347c9e068c3669b4729"
+trustee_snp_allowed_tcb_bootloader:
+  - 10
+trustee_snp_allowed_tcb_microcode:
+  - 84
+trustee_snp_allowed_tcb_snp:
+  - 24
+trustee_snp_allowed_tcb_tee:
+  - 0
+
+# Workload identity allowlist from init-data claims.
+# Required for SNP key release unless an allowlisted init-data hash is present.
+# Keep this synchronized with approved image rollout digests/tags.
+trustee_snp_allowed_container_images:
+  - "ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561"
+  - "ghcr.io/aljazceru/nutshell-tee@sha256:9ae0bf9a7d93b1da2c6ac7f95ba6935bb60a99b11589286fa10648dfb8f0e7c2"
+  - "ghcr.io/aljazceru/nutshell-tee@sha256:14cbd0bca3b3a246234133f6d192adb16095063b9536790ebbe30b88c1ca7f1a"
+
+# Init-data digest allowlist (SHA-256 over initdata TOML plaintext).
+# Use this as an identity fallback when runtime token paths omit init_data_claims.
+trustee_snp_allowed_init_data_hashes:
+  - "60e963d603eacc7b79b851fc68bcfded2fdfd10cc077f85ec4bda6ba8ef92c79"
+  - "2c48bfcbbacea1799c15c340476cedbc1365290734f6281083298b87cc03554c"
+  - "cd3438a42fcfae5a8af41052e62df1578823e78b57110f44371f96747b7ce9b5"

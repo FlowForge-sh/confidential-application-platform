@@ -1,0 +1,44 @@
+# Promtail on control-plane only: same Loki endpoint, but use local K8s API (127.0.0.1:6443)
+# so service discovery works (pods on master cannot reach 10.43.0.1).
+fullnameOverride: promtail-master
+
+config:
+  clients:
+    - url: {{ loki_remote_write_url }}
+      basic_auth:
+        username: ${LOKI_REMOTE_USERNAME}
+        password: ${LOKI_REMOTE_PASSWORD}
+
+extraArgs:
+  - -config.expand-env=true
+extraEnv:
+  - name: LOKI_REMOTE_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: {{ promtail_remote_write_secret_name }}
+        key: username
+  - name: LOKI_REMOTE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: {{ promtail_remote_write_secret_name }}
+        key: password
+  # Use local K8s API so Promtail on master can do service discovery (avoids 10.43.0.1 dial timeout).
+  - name: KUBERNETES_SERVICE_HOST
+    value: "{{ promtail_master_k8s_api_host }}"
+  - name: KUBERNETES_SERVICE_PORT
+    value: "{{ promtail_master_k8s_api_port }}"
+
+# Run only on control-plane node (K3s uses value "true").
+nodeSelector:
+  node-role.kubernetes.io/control-plane: "true"
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: node-role.kubernetes.io/master
+    operator: Exists
+    effect: NoSchedule
+
+# So Promtail can reach 127.0.0.1:6443 on the host.
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet

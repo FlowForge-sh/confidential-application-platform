@@ -1,0 +1,134 @@
+---
+# Headlamp: Kubernetes management UI. Install via Helm; expose via Caddy with basic auth.
+
+- name: Check API is reachable
+  command: k3s kubectl get ns default -o name
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: headlamp_api_check
+  changed_when: false
+
+- name: Add Headlamp Helm repo
+  command: helm repo add headlamp {{ headlamp_helm_repo }}
+  register: headlamp_repo_add
+  failed_when: headlamp_repo_add.rc != 0 and 'already exists' not in (headlamp_repo_add.stderr | default(''))
+  changed_when: headlamp_repo_add.rc == 0
+
+- name: Update Helm repos
+  command: helm repo update
+  changed_when: false
+
+- name: Create Headlamp namespace
+  command: k3s kubectl create namespace {{ headlamp_namespace }}
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: headlamp_ns_create
+  failed_when: false
+  changed_when: headlamp_ns_create.rc == 0
+
+- name: Set Headlamp base URL
+  set_fact:
+    headlamp_base_url_value: "{{ headlamp_base_url | default('') }}"
+
+- name: Install Headlamp
+  command: >
+    helm upgrade --install {{ headlamp_release_name }} headlamp/headlamp
+    --version {{ headlamp_chart_version }}
+    --namespace {{ headlamp_namespace }}
+    --set ingress.enabled=false
+    --set config.inCluster=true
+    --set config.inClusterContextName={{ headlamp_cluster_name | default('main') }}
+    --set config.sessionTTL={{ headlamp_session_ttl | default(604800) }}
+    --set config.watchPlugins={{ headlamp_watch_plugins | default(true) | lower }}
+    --set config.baseURL={{ headlamp_base_url_value | quote }}
+    --wait
+    --timeout 5m
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: headlamp_helm_result
+
+- name: Wait for Headlamp deployment
+  command: k3s kubectl rollout status deployment/{{ headlamp_release_name }} -n {{ headlamp_namespace }} --timeout=120s
+  environment:
+    KUBECONFIG: /root/.kube/config
+  when: headlamp_helm_result.changed
+
+- name: Set auto-login Service Account name (headlamp-admin for cluster-admin or release SA)
+  set_fact:
+    headlamp_auto_login_sa_name: "{{ 'headlamp-admin' if (headlamp_admin_sa_enabled | default(true)) else headlamp_release_name }}"
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Create headlamp-admin ServiceAccount and ClusterRoleBinding (cluster-admin for auto-login)
+  template:
+    src: headlamp-admin-sa.yaml.j2
+    dest: /tmp/headlamp-admin-sa.yaml
+  when: headlamp_auto_login_enabled | default(false) and headlamp_admin_sa_enabled | default(true)
+
+- name: Apply headlamp-admin ServiceAccount and ClusterRoleBinding
+  command: k3s kubectl apply -f /tmp/headlamp-admin-sa.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+  when: headlamp_auto_login_enabled | default(false) and headlamp_admin_sa_enabled | default(true)
+
+- name: Create Headlamp SA token Secret (for auto-login; cluster populates token)
+  template:
+    src: headlamp-auto-login-token-secret.yaml.j2
+    dest: /tmp/headlamp-auto-login-token-secret.yaml
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Remove existing headlamp-auto-login-token Secret so it can be recreated for current SA
+  command: k3s kubectl delete secret headlamp-auto-login-token -n {{ headlamp_namespace }} --ignore-not-found=true
+  environment:
+    KUBECONFIG: /root/.kube/config
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Apply Headlamp SA token Secret
+  command: k3s kubectl apply -f /tmp/headlamp-auto-login-token-secret.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Wait for Headlamp SA token to be populated in Secret
+  shell: k3s kubectl get secret headlamp-auto-login-token -n {{ headlamp_namespace }} -o jsonpath='{.data.token}' | base64 -d | wc -c
+  register: headlamp_token_check
+  until: headlamp_token_check.stdout | trim | int > 0
+  retries: 12
+  delay: 5
+  when: headlamp_auto_login_enabled | default(false)
+  changed_when: false
+
+- name: Copy Headlamp auto-login script to remote
+  copy:
+    src: auto-login-server.py
+    dest: /tmp/headlamp-auto-login-server.py
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Create Headlamp auto-login ConfigMap in cluster
+  command: >
+    k3s kubectl create configmap headlamp-auto-login-script
+    --namespace {{ headlamp_namespace }}
+    --from-file=auto-login-server.py=/tmp/headlamp-auto-login-server.py
+    --dry-run=client -o yaml
+  register: headlamp_autologin_cm
+  when: headlamp_auto_login_enabled | default(false)
+  changed_when: false
+
+- name: Apply Headlamp auto-login ConfigMap
+  command: k3s kubectl apply -f -
+  environment:
+    KUBECONFIG: /root/.kube/config
+  args:
+    stdin: "{{ headlamp_autologin_cm.stdout }}"
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Deploy Headlamp auto-login deployment and service
+  template:
+    src: headlamp-auto-login-deployment.yaml.j2
+    dest: /tmp/headlamp-auto-login.yaml
+  when: headlamp_auto_login_enabled | default(false)
+
+- name: Apply Headlamp auto-login deployment and service
+  command: k3s kubectl apply -f /tmp/headlamp-auto-login.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+  when: headlamp_auto_login_enabled | default(false)

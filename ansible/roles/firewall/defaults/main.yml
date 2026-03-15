@@ -1,0 +1,38 @@
+---
+# Firewall (iptables): source-based rules. We use "allow from CIDR to port X" so only
+# private traffic is allowed for internal ports; interface-based rules are not used.
+#
+# Public (from anywhere): SSH 22, HTTPS 443. Optionally restrict SSH to admin IP(s).
+# Private (from vSwitch / node network + pod CIDR only): 6443, 10250, VXLAN, WireGuard, metrics.
+
+# CIDR(s) allowed to reach internal cluster ports (6443, 10250, VXLAN, metrics).
+# Must include the node/vSwitch network where private_ip lives (e.g. Hetzner private 10.0.0.0/16).
+# cluster_cidr is appended so pods (e.g. Prometheus) can scrape node metrics.
+firewall_private_network_cidr: "10.0.0.0/16"   # Override to your vSwitch / node network
+firewall_internal_cidrs: "{{ [firewall_private_network_cidr, cluster_cidr] | unique }}"
+
+# Restrict SSH to these CIDRs. Empty or not set = allow 22 from anywhere. Set e.g. ["YOUR_IP/32"] for production.
+firewall_ssh_allowed_cidrs: []   # e.g. ["203.0.113.50/32"]
+
+# Allow HTTPS (443) from anywhere when true (e.g. Caddy ingress). Set false on workers.
+firewall_allow_ingress_ports: true
+
+# Allow HTTP (80) from anywhere. Default false. On control plane keep false so internet sees only 22 and 443.
+firewall_allow_http_ingress: false
+
+# Internal ports: only from firewall_internal_cidrs (vSwitch + cluster_cidr). Never from the public internet.
+firewall_internal_rules:
+  - { port: 6443, proto: tcp }    # Kubernetes API
+  - { port: 10250, proto: tcp }   # kubelet (metrics + exec)
+  - { port: 8472, proto: udp }    # Cilium VXLAN
+  - { port: 4789, proto: udp }    # VXLAN alt
+  - { port: 51871, proto: udp }   # Cilium WireGuard
+  - { port: 4240, proto: tcp }    # Cilium health API (node-to-node health probe)
+  - { port: 4244, proto: tcp }    # Hubble gRPC peer
+  - { port: 9100, proto: tcp }    # node-exporter
+  - { port: 9962, proto: tcp }    # Cilium agent metrics
+  - { port: 9963, proto: tcp }    # Cilium operator metrics
+  - { port: 9965, proto: tcp }    # Hubble metrics
+
+# When true, install a systemd unit that re-applies iptables rules on boot.
+firewall_iptables_persist: true

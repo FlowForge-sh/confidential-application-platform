@@ -1,0 +1,23 @@
+# Outbound connections (outside cluster CIDRs) - from Tetragon policy library.
+# Uses cluster_cidr and service_cidr from group_vars.
+# https://tetragon.io/docs/policy-library/observability/
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "monitor-network-activity-outside-cluster-cidr-range"
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "127.0.0.1"
+        - "{{ cluster_cidr }}"
+        - "{{ service_cidr }}"

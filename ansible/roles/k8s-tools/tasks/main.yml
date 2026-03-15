@@ -1,0 +1,142 @@
+---
+# K8s and tenant-deploy tools: kustomize, sops, age, k9s.
+# For tenant overlays: decrypt SOPS secrets then kustomize build (no plugins).
+
+- name: Ensure /usr/local/bin exists
+  file:
+    path: /usr/local/bin
+    state: directory
+    mode: "0755"
+  when: install_k8s_tools | default(false)
+
+# --- age (for SOPS decryption) ---
+- name: Install age (Debian/Ubuntu)
+  apt:
+    name: age
+    state: present
+    update_cache: true
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_os_family == "Debian"
+
+# --- sops ---
+- name: Download sops (amd64)
+  get_url:
+    url: "https://github.com/getsops/sops/releases/download/v{{ sops_version }}/sops-v{{ sops_version }}.linux.amd64"
+    dest: /usr/local/bin/sops
+    mode: "0755"
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_architecture == "x86_64"
+
+- name: Download sops (arm64)
+  get_url:
+    url: "https://github.com/getsops/sops/releases/download/v{{ sops_version }}/sops-v{{ sops_version }}.linux.arm64"
+    dest: /usr/local/bin/sops
+    mode: "0755"
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_architecture == "aarch64"
+
+# --- kustomize ---
+- name: Download kustomize (amd64)
+  get_url:
+    url: "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv{{ kustomize_version }}/kustomize_v{{ kustomize_version }}_linux_amd64.tar.gz"
+    dest: /tmp/kustomize.tar.gz
+    mode: "0644"
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_architecture == "x86_64"
+
+- name: Download kustomize (arm64)
+  get_url:
+    url: "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv{{ kustomize_version }}/kustomize_v{{ kustomize_version }}_linux_arm64.tar.gz"
+    dest: /tmp/kustomize.tar.gz
+    mode: "0644"
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_architecture == "aarch64"
+
+- name: Unarchive kustomize and install to /usr/local/bin
+  unarchive:
+    src: /tmp/kustomize.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    extra_opts: [--strip-components=0]
+    creates: /usr/local/bin/kustomize
+  when: install_k8s_tools | default(false)
+
+- name: Chmod kustomize
+  file:
+    path: /usr/local/bin/kustomize
+    mode: "0755"
+  when: install_k8s_tools | default(false)
+
+# --- k9s ---
+- name: Download k9s (amd64)
+  get_url:
+    url: "https://github.com/derailed/k9s/releases/download/v{{ k9s_version }}/k9s_Linux_amd64.tar.gz"
+    dest: /tmp/k9s.tar.gz
+    mode: "0644"
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_architecture == "x86_64"
+
+- name: Download k9s (arm64)
+  get_url:
+    url: "https://github.com/derailed/k9s/releases/download/v{{ k9s_version }}/k9s_Linux_arm64.tar.gz"
+    dest: /tmp/k9s.tar.gz
+    mode: "0644"
+  when:
+    - install_k8s_tools | default(false)
+    - ansible_architecture == "aarch64"
+
+- name: Ensure k9s extract directory exists
+  file:
+    path: /tmp/k9s-extract
+    state: directory
+    mode: "0755"
+  when: install_k8s_tools | default(false)
+
+- name: Unarchive k9s
+  unarchive:
+    src: /tmp/k9s.tar.gz
+    dest: /tmp/k9s-extract
+    remote_src: true
+  when: install_k8s_tools | default(false)
+
+- name: Find k9s binary in extract dir
+  find:
+    path: /tmp/k9s-extract
+    patterns: "k9s"
+    file_type: file
+  register: k9s_found
+  when: install_k8s_tools | default(false)
+
+- name: Copy k9s to /usr/local/bin
+  copy:
+    src: "{{ k9s_found.files[0].path }}"
+    dest: /usr/local/bin/k9s
+    mode: "0755"
+    remote_src: true
+  when:
+    - install_k8s_tools | default(false)
+    - k9s_found.matched | default(0) > 0
+
+- name: Chmod k9s
+  file:
+    path: /usr/local/bin/k9s
+    mode: "0755"
+  when: install_k8s_tools | default(false)
+
+- name: Verify k8s-tools (kustomize, sops, age, k9s)
+  command: "{{ item }}"
+  loop:
+    - kustomize version
+    - sops --version
+    - age --version
+    - k9s version
+  register: k8s_tools_check
+  changed_when: false
+  failed_when: (k8s_tools_check.results | map(attribute='rc') | list | max | default(0)) != 0
+  when: install_k8s_tools | default(false)

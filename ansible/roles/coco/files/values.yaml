@@ -1,0 +1,156 @@
+# Confidential Containers Helm Chart Values
+# Version: 0.18.0
+# Chart: https://github.com/confidential-containers/charts
+# Docs: https://confidentialcontainers.org/docs/
+
+# Architecture for x86_64 dedicated servers
+architecture: "x86_64"
+
+# Custom Containerd Installation
+# Disabled - K3s manages its own containerd
+customContainerd:
+  enabled: false
+
+# Kata Runtime as CoCo Runtime
+# This deploys kata-deploy with TEE-enabled shims
+kata-as-coco-runtime:
+  enabled: true
+  
+  # K3s-specific configuration
+  k8sDistribution: k3s
+  
+  # Image pull policy
+  imagePullPolicy: IfNotPresent
+  
+  # Debug mode (set to true for troubleshooting)
+  debug: false
+  
+  # Snapshotter for image encryption (nydus); default KBS URL set on workers by coco-image-encryption role
+  snapshotter:
+    setup: ["nydus"]
+  
+  # TEE (Trusted Execution Environment) Shims
+  # Enable both AMD SEV-SNP and Intel TDX support
+  shims:
+    # AMD SEV-SNP shim
+    qemu-snp:
+      enabled: true
+      supportedArches:
+        - amd64
+      allowedHypervisorAnnotations: []
+      containerd:
+        snapshotter: nydus
+        forceGuestPull: false
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""
+    
+    # Intel TDX shim
+    qemu-tdx:
+      enabled: true
+      supportedArches:
+        - amd64
+      allowedHypervisorAnnotations: []
+      containerd:
+        snapshotter: nydus
+        forceGuestPull: false
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""
+    
+    # Development/Testing shim (non-TEE for testing)
+    qemu-coco-dev:
+      enabled: true
+      supportedArches:
+        - amd64
+        - s390x
+      allowedHypervisorAnnotations: []
+      containerd:
+        snapshotter: nydus
+        forceGuestPull: false
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""
+    
+    # Runtime-rs variant (Rust-based runtime)
+    qemu-coco-dev-runtime-rs:
+      enabled: false  # Optional, can enable for testing
+      supportedArches:
+        - amd64
+        - s390x
+      allowedHypervisorAnnotations: []
+      containerd:
+        snapshotter: nydus
+        forceGuestPull: false
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""
+    
+    # NVIDIA GPU with SEV-SNP (if needed)
+    qemu-nvidia-gpu-snp:
+      enabled: false  # Enable if using NVIDIA GPUs with SEV
+      supportedArches:
+        - amd64
+      allowedHypervisorAnnotations: []
+      containerd:
+        forceGuestPull: true
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""
+    
+    # NVIDIA GPU with TDX (if needed)
+    qemu-nvidia-gpu-tdx:
+      enabled: false  # Enable if using NVIDIA GPUs with TDX
+      supportedArches:
+        - amd64
+      allowedHypervisorAnnotations: []
+      containerd:
+        forceGuestPull: true
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""
+    
+    # Disable non-TEE runtimes (we don't need these)
+    clh:
+      enabled: false
+    cloud-hypervisor:
+      enabled: false
+    dragonball:
+      enabled: false
+    fc:
+      enabled: false
+    qemu:
+      enabled: false
+    qemu-runtime-rs:
+      enabled: false
+  
+  # RuntimeClass Configuration
+  runtimeClasses:
+    enabled: true
+    createDefault: false  # We'll create custom RuntimeClasses
+    defaultName: "kata"
+  
+  # Default shim per architecture
+  # This determines which shim to use when "kata" RuntimeClass is specified
+  defaultShim:
+    amd64: qemu-snp  # Use SEV-SNP by default on AMD hardware
+
+# Node selector (optional - target specific nodes)
+# nodeSelector:
+#   kata.enabled: "true"
+
+# Tolerations (optional - schedule on tainted nodes)
+# tolerations:
+#   - operator: Exists

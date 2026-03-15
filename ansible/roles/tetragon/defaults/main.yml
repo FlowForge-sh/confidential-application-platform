@@ -1,0 +1,34 @@
+---
+# Tetragon: eBPF-based security observability and runtime enforcement.
+# Chart: https://github.com/cilium/tetragon/tree/main/install/kubernetes/tetragon
+# Docs: https://tetragon.io/docs/installation/kubernetes/
+
+tetragon_helm_repo: https://helm.cilium.io
+tetragon_release_name: tetragon
+tetragon_namespace: kube-system
+# Chart version; align with Tetragon releases: https://github.com/cilium/tetragon/releases
+tetragon_chart_version: "1.6.0"
+# tetra CLI (control node). Tag from Tetragon releases; override in group_vars with tetragon_tetra_cli_version.
+tetragon_tetra_cli_version: "v1.6.0"
+
+# K3s containerd socket (Tetragon needs CRI for pod/container association)
+tetragon_cri_enabled: true
+tetragon_cri_socket_host_path: "/run/k3s/containerd/containerd.sock"
+
+# Prometheus metrics (ports 2112 agent, 2113 operator); ServiceMonitor for Prometheus Operator
+tetragon_prometheus_enabled: true
+tetragon_prometheus_service_monitor_enabled: true
+tetragon_operator_prometheus_service_monitor_enabled: true
+
+# Process credentials visibility (required for SUID, file capabilities, fileless/deleted binary observability)
+tetragon_enable_process_cred: true
+
+# Export: "stdout" (default; Promtail collects pod logs -> Loki) or "file" (hostPath + optional Promtail file scrape)
+tetragon_export_mode: stdout
+# When tetragon_export_mode is "file", host path for JSON export (must exist or be created)
+tetragon_export_host_path: "/var/log/tetragon"
+
+# Policy library: apply observability TracingPolicies from roles/tetragon/files/policylibrary/
+tetragon_apply_observability_policies: true
+# GitHub ref for policy library when downloading (empty = use bundled files only)
+tetragon_policy_library_ref: "main"

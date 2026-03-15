@@ -1,0 +1,255 @@
+---
+# Prometheus Operator + exporters only (no kube-prometheus-stack, no Grafana).
+# Deploys: operator, node-exporter, kube-state-metrics, blackbox-exporter,
+# Prometheus Agent (scrape + remote write only, no local storage). Cilium/Hubble via ServiceMonitor.
+
+- name: Ensure KUBECONFIG is set for Helm
+  set_fact:
+    ansible_env: "{{ ansible_env | default({}) | combine({'KUBECONFIG': '/root/.kube/config'}) }}"
+
+- name: Check API is reachable
+  command: k3s kubectl get ns default -o name
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: api_check
+  changed_when: false
+
+- name: Add Prometheus community Helm repo
+  command: helm repo add prometheus-community {{ prometheus_community_repo }}
+  changed_when: false
+
+- name: Update Helm repos
+  command: helm repo update
+  changed_when: false
+
+- name: Create monitoring namespace
+  command: k3s kubectl create namespace {{ prometheus_namespace }}
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: ns_create
+  failed_when: false
+  changed_when: ns_create.rc == 0
+
+# If you had kube-prometheus-stack (Grafana, etc.), wipe the monitoring namespace manually before running this role:
+#   helm uninstall kube-prometheus-stack -n monitoring
+#   kubectl delete namespace monitoring --wait=false
+#   kubectl create namespace monitoring
+# Then run the playbook.
+
+# --- Load remote write credentials (SOPS or vars) ---
+- name: Resolve SOPS credentials file path
+  set_fact:
+    monitoring_credentials_sops_file_resolved: "{{ monitoring_credentials_sops_file | default(playbook_dir + '/../inventory/group_vars/monitoring_remote_write.yml.enc') }}"
+  when: prometheus_remote_write_url is not defined
+
+- name: Decrypt and load monitoring remote write credentials (SOPS)
+  delegate_to: localhost
+  run_once: true
+  command: "sops -d {{ monitoring_credentials_sops_file_resolved }}"
+  register: monitoring_creds_raw
+  changed_when: false
+  when:
+    - prometheus_remote_write_url is not defined
+    - monitoring_credentials_sops_file_resolved is defined
+    - monitoring_credentials_sops_file_resolved | length > 0
+
+- name: Set remote write vars from SOPS on primary master
+  set_fact:
+    prometheus_remote_write_url: "{{ (monitoring_creds_raw.stdout | from_yaml).url }}"
+    prometheus_remote_write_username: "{{ (monitoring_creds_raw.stdout | from_yaml).username }}"
+    prometheus_remote_write_password: "{{ (monitoring_creds_raw.stdout | from_yaml).password }}"
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+  when:
+    - monitoring_creds_raw is defined
+    - monitoring_creds_raw.stdout is defined
+    - monitoring_creds_raw.stdout | length > 0
+
+- name: Fail when remote write URL is missing
+  fail:
+    msg: "Set prometheus_remote_write_url (and username/password) or provide SOPS file via monitoring_credentials_sops_file."
+  when: prometheus_remote_write_url is not defined or prometheus_remote_write_url | length == 0
+
+# --- Create remote write basic auth secret ---
+- name: Render remote write secret manifest
+  template:
+    src: remote-write-secret.yaml.j2
+    dest: /tmp/prometheus-remote-write-secret.yaml
+  no_log: true
+
+- name: Apply Prometheus remote write basic auth secret
+  command: k3s kubectl apply -f /tmp/prometheus-remote-write-secret.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+  no_log: true
+
+# --- Prometheus Operator only (from kube-prometheus-stack, rest disabled) ---
+- name: Check if Prometheus Operator release exists
+  command: helm list -n {{ prometheus_namespace }} -q -f '^{{ prometheus_operator_release_name }}$'
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: prom_operator_check
+  failed_when: false
+  changed_when: false
+
+- name: Install Prometheus Operator only (no Grafana, Alertmanager, default Prometheus)
+  command: >
+    helm upgrade --install {{ prometheus_operator_release_name }} {{ prometheus_operator_chart }}
+    --version {{ prometheus_operator_chart_version }}
+    --namespace {{ prometheus_namespace }}
+    --set grafana.enabled=false
+    --set alertmanager.enabled=false
+    --set prometheus.enabled=false
+    --set prometheus.nodeExporter.enabled=false
+    --set prometheus.kubeStateMetrics.enabled=false
+    --set defaultRules.create=false
+    --set kubeStateMetrics.enabled=false
+    --set nodeExporter.enabled=false
+    --wait
+    --timeout 5m
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: prom_operator_install
+  when: prom_operator_check.stdout | length == 0
+
+- name: Wait for Prometheus Operator deployment
+  command: k3s kubectl wait --for=condition=Available deployment -l app.kubernetes.io/name=kube-prometheus-stack-prometheus-operator -n {{ prometheus_namespace }} --timeout=120s
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+# Stack's kubelet ServiceMonitor discovers wrong targets (empty __address__). We use additional scrape config for kubelet/cadvisor instead.
+- name: Remove stack kubelet ServiceMonitor (use our additional scrape config only)
+  command: k3s kubectl delete servicemonitor prometheus-operator-kube-p-kubelet -n {{ prometheus_namespace }} --ignore-not-found=true
+  environment:
+    KUBECONFIG: /root/.kube/config
+  failed_when: false
+
+# --- Node exporter ---
+- name: Install prometheus-node-exporter
+  command: >
+    helm upgrade --install {{ prometheus_node_exporter_release_name }} prometheus-community/prometheus-node-exporter
+    --version {{ prometheus_node_exporter_chart_version }}
+    --namespace {{ prometheus_namespace }}
+    --set serviceMonitor.enabled=true
+    --wait
+    --timeout 3m
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+# --- Kube state metrics (two releases like Promtail: worker + control-plane with local API) ---
+- name: Render kube-state-metrics worker values (worker node(s); in-cluster K8s API)
+  template:
+    src: kube-state-metrics-worker-values.yaml.j2
+    dest: /tmp/kube-state-metrics-worker-values.yaml
+
+- name: Install kube-state-metrics (worker only)
+  command: >
+    helm upgrade --install {{ prometheus_kube_state_metrics_release_name }} prometheus-community/kube-state-metrics
+    --version {{ prometheus_kube_state_metrics_chart_version }}
+    --namespace {{ prometheus_namespace }}
+    --set serviceMonitor.enabled=true
+    -f /tmp/kube-state-metrics-worker-values.yaml
+    --wait
+    --timeout 3m
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+- name: Render kube-state-metrics control-plane values (control-plane + local API)
+  template:
+    src: kube-state-metrics-control-plane-values.yaml.j2
+    dest: /tmp/kube-state-metrics-control-plane-values.yaml
+
+- name: Install kube-state-metrics (control-plane only; K8s API at {{ prometheus_kube_state_metrics_k8s_api_host }}:{{ prometheus_kube_state_metrics_k8s_api_port }})
+  command: >
+    helm upgrade --install {{ prometheus_kube_state_metrics_master_release_name }} prometheus-community/kube-state-metrics
+    --version {{ prometheus_kube_state_metrics_chart_version }}
+    --namespace {{ prometheus_namespace }}
+    --set serviceMonitor.enabled=true
+    -f /tmp/kube-state-metrics-control-plane-values.yaml
+    --wait
+    --timeout 3m
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+# --- Blackbox exporter ---
+- name: Install prometheus-blackbox-exporter
+  command: >
+    helm upgrade --install {{ prometheus_blackbox_exporter_release_name }} prometheus-community/prometheus-blackbox-exporter
+    --version {{ prometheus_blackbox_exporter_chart_version }}
+    --namespace {{ prometheus_namespace }}
+    --set serviceMonitor.enabled=true
+    --wait
+    --timeout 3m
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+# --- ServiceMonitors for our exporters (charts may not create them) ---
+- name: Render exporters ServiceMonitors
+  template:
+    src: exporters-servicemonitors.yaml.j2
+    dest: /tmp/exporters-servicemonitors-{{ prometheus_namespace }}.yaml
+
+- name: Apply exporters ServiceMonitors
+  command: k3s kubectl apply -f /tmp/exporters-servicemonitors-{{ prometheus_namespace }}.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+# --- Prometheus Agent (CR + additional scrape config Secret in one file) ---
+- name: Render Prometheus Agent manifest (CR + scrape config)
+  template:
+    src: prometheus-agent.yaml.j2
+    dest: /tmp/prometheus-agent-{{ prometheus_namespace }}.yaml
+
+# RBAC for Prometheus Agent (service discovery)
+- name: Render Prometheus RBAC manifest
+  template:
+    src: prometheus-rbac.yaml.j2
+    dest: /tmp/prometheus-rbac-{{ prometheus_namespace }}.yaml
+
+- name: Apply Prometheus RBAC
+  command: k3s kubectl apply -f /tmp/prometheus-rbac-{{ prometheus_namespace }}.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+
+- name: Remove full Prometheus CR if present (role uses Agent only)
+  command: k3s kubectl delete prometheus {{ prometheus_cr_name }} -n {{ prometheus_namespace }} --ignore-not-found=true
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: _prom_cr_delete
+  changed_when: "_prom_cr_delete.rc == 0 and 'deleted' in _prom_cr_delete.stdout"
+
+- name: Apply Prometheus Agent (CR + additional scrape configs)
+  command: k3s kubectl apply -f /tmp/prometheus-agent-{{ prometheus_namespace }}.yaml
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: prom_cr_apply
+  changed_when: "'configured' in prom_cr_apply.stdout or 'created' in prom_cr_apply.stdout"
+
+# --- Post-install check ---
+- name: Brief wait for monitoring pods to schedule
+  pause:
+    seconds: 30
+  when: prom_cr_apply is changed
+
+- name: Get pods in monitoring namespace
+  command: k3s kubectl get pods -n {{ prometheus_namespace }} -o json
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: monitoring_pods_json
+  changed_when: false
+
+- name: Set pending count in monitoring namespace
+  set_fact:
+    monitoring_pending_count: "{{ (monitoring_pods_json.stdout | from_json)['items'] | selectattr('status.phase', 'equalto', 'Pending') | list | length }}"
+
+- name: Display monitoring namespace pod status
+  debug:
+    msg: "{{ item.metadata.name }} → {{ item.status.phase }}"
+  loop: "{{ (monitoring_pods_json.stdout | from_json)['items'] }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Fail if any monitoring pods are Pending
+  fail:
+    msg: "{{ monitoring_pending_count }} pod(s) in {{ prometheus_namespace }} are Pending. Ensure CNI (Cilium) is deployed before this role."
+  when: monitoring_pending_count | int > 0

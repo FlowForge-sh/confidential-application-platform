@@ -1,0 +1,238 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resource-policy
+  namespace: {{ trustee_operator_namespace }}
+data:
+  policy.rego: |
+    package policy
+
+    import rego.v1
+
+    default allow := false
+
+    resource_bindings := {
+{% for resource_name, binding in trustee_kbs_resource_bindings.items() %}
+      "{{ resource_name }}": {
+        "repository": "{{ binding.repository | default('default') }}",
+        "tag": "{{ binding.tag | default('workload-secret-seed') }}",
+        "allowed_images": [{% for image in binding.allowed_images | default([]) %}"{{ image | lower }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+        "allowed_namespaces": [{% for ns in binding.allowed_namespaces | default([]) %}"{{ ns | lower }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+        "allowed_service_accounts": [{% for sa in binding.allowed_service_accounts | default([]) %}"{{ sa | lower }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+        "allowed_init_data_hashes": [{% for hash in binding.allowed_init_data_hashes | default([]) %}"{{ hash | lower }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+      }{% if not loop.last %},{% endif %}
+{% endfor %}
+    }
+
+    # Allow attestation when token contains SNP measurement in allowlist (fallback when ear.status not affirming).
+    allowed_snp_measurements := [{% for v in trustee_snp_allowed_measurements %}"{{ v | lower }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+
+    snp_measurement_from_token contains m if {
+      ae := input.submods.cpu0["ear.veraison.annotated-evidence"]
+      ae.snp.measurement
+      m := lower(ae.snp.measurement)
+    }
+
+    attestation_affirming if {
+      some m in snp_measurement_from_token
+      m in allowed_snp_measurements
+    }
+
+    # Attestation gate (fail-closed):
+    # Require a successful attestation appraisal before key release.
+    # Trustee attestation policy drives EAR appraisal status per submodule.
+    attestation_any_not_affirming if {
+      some _, submod in input.submods
+      submod["ear.status"] != "affirming"
+    }
+
+    attestation_affirming if {
+      count(input.submods) > 0
+      not attestation_any_not_affirming
+    }
+
+    attestation_affirming if {
+      input["ear.status"] == "affirming"
+    }
+
+    # Fallback for token shapes that omit EAR submods but still include
+    # attestation-derived TEE claims.
+    attestation_affirming if {
+      tee := lower(object.get(input, "tee", ""))
+      tee in {"snp", "tdx", "azsnpvtpm", "aztdxvtpm", "se"}
+      lower(object.get(input, "attester_type", "hardware")) != "sample"
+    }
+
+    # KBS may pass resource-path as either:
+    #   1) "resource/<repository>/<resource-name>/<tag>" (string)
+    #   2) ["<repository>", "<resource-name>", "<tag>"] (array)
+    requested_path := path if {
+      rp := data["resource-path"]
+      is_string(rp)
+      path := split(rp, "/")
+    }
+
+    requested_path := path if {
+      rp := data["resource-path"]
+      is_array(rp)
+      path := rp
+    }
+
+    requested_binding := binding if {
+      count(requested_path) == 4
+      requested_path[0] == "resource"
+      binding := resource_bindings[requested_path[2]]
+      requested_path[1] == binding.repository
+      requested_path[3] == binding.tag
+    }
+
+    requested_binding := binding if {
+      count(requested_path) == 3
+      binding := resource_bindings[requested_path[1]]
+      requested_path[0] == binding.repository
+      requested_path[2] == binding.tag
+    }
+
+    container_image_name(container) := image if {
+      image := container["OCI"]["Annotations"]["io.kubernetes.cri.image-name"]
+      is_string(image)
+      image != ""
+    }
+
+    container_image_name(container) := image if {
+      image := container["image_name"]
+      is_string(image)
+      image != ""
+    }
+
+    container_annotation(container, key) := value if {
+      value := container["OCI"]["Annotations"][key]
+      is_string(value)
+      value != ""
+    }
+
+    requester_images contains image if {
+      container := input["submods"]["cpu0"]["ear.veraison.annotated-evidence.init_data_claims"]["agent_policy_claims"]["containers"][_]
+      image := lower(container_image_name(container))
+    }
+
+    requester_images contains image if {
+      container := input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["init_data_claims"]["agent_policy_claims"]["containers"][_]
+      image := lower(container_image_name(container))
+    }
+
+    requester_images contains image if {
+      container := input["init_data_claims"]["agent_policy_claims"]["containers"][_]
+      image := lower(container_image_name(container))
+    }
+
+    requester_images_present if {
+      count(requester_images) > 0
+    }
+
+    requester_namespaces contains ns if {
+      container := input["submods"]["cpu0"]["ear.veraison.annotated-evidence.init_data_claims"]["agent_policy_claims"]["containers"][_]
+      ns := lower(container_annotation(container, "io.kubernetes.pod.namespace"))
+    }
+
+    requester_namespaces contains ns if {
+      container := input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["init_data_claims"]["agent_policy_claims"]["containers"][_]
+      ns := lower(container_annotation(container, "io.kubernetes.pod.namespace"))
+    }
+
+    requester_namespaces contains ns if {
+      container := input["init_data_claims"]["agent_policy_claims"]["containers"][_]
+      ns := lower(container_annotation(container, "io.kubernetes.pod.namespace"))
+    }
+
+    requester_namespaces_present if {
+      count(requester_namespaces) > 0
+    }
+
+    requester_service_accounts contains sa if {
+      container := input["submods"]["cpu0"]["ear.veraison.annotated-evidence.init_data_claims"]["agent_policy_claims"]["containers"][_]
+      sa := lower(container_annotation(container, "io.kubernetes.pod.service-account.name"))
+    }
+
+    requester_service_accounts contains sa if {
+      container := input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["init_data_claims"]["agent_policy_claims"]["containers"][_]
+      sa := lower(container_annotation(container, "io.kubernetes.pod.service-account.name"))
+    }
+
+    requester_service_accounts contains sa if {
+      container := input["init_data_claims"]["agent_policy_claims"]["containers"][_]
+      sa := lower(container_annotation(container, "io.kubernetes.pod.service-account.name"))
+    }
+
+    requester_service_accounts_present if {
+      count(requester_service_accounts) > 0
+    }
+
+    requester_init_data_hashes contains hash if {
+      raw := input["submods"]["cpu0"]["ear.veraison.annotated-evidence.init_data"]
+      is_string(raw)
+      raw != ""
+      hash := lower(raw)
+    }
+
+    requester_init_data_hashes contains hash if {
+      raw := input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["init_data"]
+      is_string(raw)
+      raw != ""
+      hash := lower(raw)
+    }
+
+    requester_init_data_hashes contains hash if {
+      raw := input["init_data"]
+      is_string(raw)
+      raw != ""
+      hash := lower(raw)
+    }
+
+    requester_init_data_present if {
+      count(requester_init_data_hashes) > 0
+    }
+
+    binding_allows_attested_identity(binding) if {
+      requester_images_present
+      count(binding.allowed_images) > 0
+      some image in requester_images
+      image in binding.allowed_images
+    }
+
+    binding_allows_attested_identity(binding) if {
+      requester_init_data_present
+      count(binding.allowed_init_data_hashes) > 0
+      some hash in requester_init_data_hashes
+      hash in binding.allowed_init_data_hashes
+    }
+
+    binding_allows_namespace(binding) if {
+      count(binding.allowed_namespaces) == 0
+    }
+
+    binding_allows_namespace(binding) if {
+      count(binding.allowed_namespaces) > 0
+      requester_namespaces_present
+      some ns in requester_namespaces
+      ns in binding.allowed_namespaces
+    }
+
+    binding_allows_service_account(binding) if {
+      count(binding.allowed_service_accounts) == 0
+    }
+
+    binding_allows_service_account(binding) if {
+      count(binding.allowed_service_accounts) > 0
+      requester_service_accounts_present
+      some sa in requester_service_accounts
+      sa in binding.allowed_service_accounts
+    }
+
+    allow if {
+      binding := requested_binding
+      attestation_affirming
+      binding_allows_attested_identity(binding)
+      binding_allows_namespace(binding)
+      binding_allows_service_account(binding)
+    }

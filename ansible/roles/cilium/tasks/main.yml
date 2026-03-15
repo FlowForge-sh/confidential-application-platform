@@ -1,0 +1,397 @@
+---
+- name: Wait for K3s API to be ready
+  command: k3s kubectl get nodes
+  register: api_ready
+  retries: 30
+  delay: 10
+  until: api_ready.rc == 0
+  changed_when: false
+
+# Ensure kubeconfig server is connectable (K3s can overwrite with 0.0.0.0); Helm uses KUBECONFIG.
+- name: Re-patch kubeconfig server for Helm (private-only)
+  replace:
+    path: /root/.kube/config
+    regexp: 'https://(127\.0\.0\.1|0\.0\.0\.0):6443'
+    replace: 'https://{{ hostvars[inventory_hostname]["private_ip"] }}:6443'
+  when: hostvars[inventory_hostname].private_ip is defined and hostvars[inventory_hostname].private_ip != hostvars[inventory_hostname].ansible_host
+
+- name: Re-patch kubeconfig server for Helm (non–private-only)
+  replace:
+    path: /root/.kube/config
+    regexp: 'https://0\.0\.0\.0:6443'
+    replace: 'https://127.0.0.1:6443'
+  when: hostvars[inventory_hostname].private_ip is not defined or hostvars[inventory_hostname].private_ip == hostvars[inventory_hostname].ansible_host
+
+# API can be "partially active" (works sometimes, 503/connection refused other times). Require
+# several consecutive successful calls before running Helm to avoid install failures.
+- name: Wait for API stability (consecutive successful calls)
+  shell: |
+    set -e
+    for i in 1 2 3 4 5; do
+      KUBECONFIG=/root/.kube/config k3s kubectl get ns default -o name >/dev/null || exit 1
+      sleep 2
+    done
+  register: api_stable
+  retries: 24
+  delay: 10
+  until: api_stable.rc == 0
+  changed_when: false
+
+- name: Install Helm 4
+  block:
+    - name: Check if Helm is installed
+      command: which helm
+      register: helm_check
+      failed_when: false
+      changed_when: false
+    
+    - name: Download Helm 4 install script
+      get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+        dest: /tmp/get-helm-4.sh
+        mode: '0700'
+      when: helm_check.rc != 0
+    
+    - name: Install Helm 4
+      command: /tmp/get-helm-4.sh
+      when: helm_check.rc != 0
+
+- name: Add Cilium Helm repo
+  command: helm repo add cilium https://helm.cilium.io/
+  changed_when: false
+
+- name: Update Helm repos
+  command: helm repo update
+  changed_when: false
+
+# Install Cilium CLI so 'cilium status' works on the master (playbook and manual runs).
+- name: Set Cilium CLI architecture
+  set_fact:
+    cilium_cli_arch: "{{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}"
+
+- name: Download Cilium CLI (Linux)
+  get_url:
+    url: "https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ cilium_cli_arch }}.tar.gz"
+    dest: /tmp/cilium-cli.tar.gz
+    mode: "0644"
+
+- name: Unarchive Cilium CLI to /usr/local/bin
+  unarchive:
+    src: /tmp/cilium-cli.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+
+- name: Ensure Cilium CLI is executable
+  file:
+    path: /usr/local/bin/cilium
+    mode: "0755"
+
+- name: Template Cilium values file
+  template:
+    src: values.yaml
+    dest: /tmp/cilium-values.yaml
+    mode: '0644'
+
+# Idempotency: do NOT re-install Cilium when it is already installed (re-applying breaks networking).
+# Skip Helm install/upgrade when the release exists unless cilium_force_helm_upgrade is set (e.g. to enable ServiceMonitor).
+# To upgrade version, change cilium_chart_version and run once with cilium_force_helm_upgrade: true.
+- name: Check if Cilium Helm release exists
+  command: helm list -n kube-system -q -f '^cilium$'
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: cilium_release_check
+  failed_when: false
+  changed_when: false
+
+- name: Set Cilium skip helm (release exists and not forcing upgrade)
+  set_fact:
+    cilium_skip_helm: "{{ ((cilium_release_check.stdout | default('') | trim) == 'cilium') and not (cilium_force_helm_upgrade | default(false)) }}"
+
+- name: Report Cilium idempotent skip
+  debug:
+    msg: "Cilium Helm release already exists; skipping install/upgrade to avoid breaking cluster networking."
+  when: cilium_skip_helm | default(false)
+
+- name: Install Cilium and verify (with debug on failure)
+  block:
+    # --force-conflicts: allow upgrade despite field-manager conflicts (e.g. hubble-peer patched for internalTrafficPolicy, cilium-config touched by operator).
+    - name: Install/Upgrade Cilium
+      command: >
+        helm upgrade --install cilium cilium/cilium
+        --version {{ cilium_chart_version }}
+        --namespace kube-system
+        --values /tmp/cilium-values.yaml
+        --force-conflicts
+        --wait
+        --timeout 10m
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cilium_helm_result
+      retries: 5
+      until: cilium_helm_result.rc == 0
+      delay: 45
+      when: not (cilium_skip_helm | default(false))
+
+    - name: Wait for Cilium pods
+      command: k3s kubectl wait --for=condition=Ready pods --all -n kube-system -l k8s-app=cilium --timeout=600s
+      retries: 3
+      delay: 10
+      changed_when: false
+      when: not (cilium_skip_helm | default(false))
+
+    # Require all Cilium agent and operator pods to be Running and Ready (catches Init:Error / CrashLoop).
+    - name: Ensure all Cilium agent pods are Running and Ready
+      command: k3s kubectl wait --for=condition=Ready pod -l k8s-app=cilium -n kube-system --timeout=30s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cilium_agent_wait
+      failed_when: false
+      changed_when: false
+
+    - name: Ensure all Cilium operator pods are Running and Ready
+      command: k3s kubectl wait --for=condition=Ready pod -l io.cilium/app=operator -n kube-system --timeout=30s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cilium_operator_wait
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if any Cilium agent pod is not Ready
+      fail:
+        msg: "One or more Cilium agent pods are not Ready. Run on primary master: KUBECONFIG=/root/.kube/config k3s kubectl get pods -n kube-system -l k8s-app=cilium -o wide"
+      when: cilium_agent_wait.rc != 0
+
+    - name: Fail if any Cilium operator pod is not Ready
+      fail:
+        msg: "One or more Cilium operator pods are not Ready. Run on primary master: KUBECONFIG=/root/.kube/config k3s kubectl get pods -n kube-system -l io.cilium/app=operator -o wide"
+      when: cilium_operator_wait.rc != 0
+
+    - name: Run cilium status --verbose (verify installation)
+      command: cilium status --verbose
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cilium_status_result
+      changed_when: false
+
+    - name: Display cilium status output
+      debug:
+        msg: "{{ cilium_status_result.stdout_lines }}"
+
+    - name: Fail if Cilium is not ready
+      fail:
+        msg: "Cilium status --verbose reported an issue (exit code {{ cilium_status_result.rc }}). Check output above. On the primary master run: KUBECONFIG=/root/.kube/config cilium status --verbose"
+      when: cilium_status_result.rc != 0
+
+    # cilium status can still be "OK" while node-to-node dataplane is degraded (e.g. mixed encryption mode
+    # or failed cilium-health host probes). Enforce convergence before considering apply successful.
+    - name: Verify Cilium node-to-node convergence (encryption and cluster health)
+      shell: |
+        set -euo pipefail
+        pods="$(k3s kubectl --kubeconfig=/root/.kube/config get pods -n kube-system -l k8s-app=cilium -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}')"
+        node_count="$(k3s kubectl --kubeconfig=/root/.kube/config get nodes --no-headers | wc -l | tr -d ' ')"
+        expected_mode="{{ cilium_expected_encryption_mode | default('Wireguard') }}"
+        min_peers=0
+        if [ "${node_count}" -gt 1 ]; then
+          min_peers=$((node_count - 1))
+        fi
+
+        failed=0
+        for pod in ${pods}; do
+          status="$(k3s kubectl --kubeconfig=/root/.kube/config exec -n kube-system "${pod}" -- cilium-dbg status)"
+          enc_mode="$(printf '%s\n' "${status}" | awk '/^Encryption:/{print $2; exit}')"
+          peers="$(printf '%s\n' "${status}" | sed -n 's/.*Peers: \([0-9][0-9]*\).*/\1/p' | head -n1)"
+          health_ratio="$(printf '%s\n' "${status}" | awk '/^Cluster health:/{print $3; exit}')"
+          echo "pod=${pod} encryption=${enc_mode:-unknown} peers=${peers:-n/a} cluster_health=${health_ratio:-unknown}"
+
+          if [ -n "${expected_mode}" ] && [ "${enc_mode}" != "${expected_mode}" ]; then
+            echo "ERROR: ${pod} encryption mode ${enc_mode:-missing} != ${expected_mode}"
+            failed=1
+          fi
+
+          if [ "${min_peers}" -gt 0 ] && [ -n "${peers}" ] && [ "${peers}" -lt "${min_peers}" ]; then
+            echo "ERROR: ${pod} has ${peers} wireguard peers, expected at least ${min_peers}"
+            failed=1
+          fi
+
+          if [ -z "${health_ratio}" ]; then
+            echo "ERROR: ${pod} missing Cluster health output"
+            failed=1
+          else
+            healthy="${health_ratio%/*}"
+            total="${health_ratio#*/}"
+            if [ "${healthy}" != "${total}" ]; then
+              echo "ERROR: ${pod} cluster health degraded (${health_ratio} reachable)"
+              failed=1
+            fi
+          fi
+        done
+
+        exit "${failed}"
+      args:
+        executable: /bin/bash
+      register: cilium_convergence_check
+      retries: "{{ cilium_convergence_retries | default(8) }}"
+      delay: "{{ cilium_convergence_retry_delay | default(20) }}"
+      until: cilium_convergence_check.rc == 0
+      failed_when: false
+      changed_when: false
+
+    - name: Restart Cilium daemonset once on convergence failure
+      command: k3s kubectl --kubeconfig=/root/.kube/config rollout restart daemonset/cilium -n kube-system
+      register: cilium_rollout_restart
+      changed_when: cilium_rollout_restart.rc == 0
+      when:
+        - cilium_convergence_check.rc != 0
+        - cilium_auto_restart_on_convergence_failure | default(true)
+
+    - name: Wait for Cilium daemonset rollout after restart
+      command: k3s kubectl --kubeconfig=/root/.kube/config rollout status daemonset/cilium -n kube-system --timeout=600s
+      register: cilium_rollout_status_after_restart
+      changed_when: false
+      when:
+        - cilium_convergence_check.rc != 0
+        - cilium_auto_restart_on_convergence_failure | default(true)
+
+    - name: Re-check Cilium node-to-node convergence after restart
+      shell: |
+        set -euo pipefail
+        pods="$(k3s kubectl --kubeconfig=/root/.kube/config get pods -n kube-system -l k8s-app=cilium -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}')"
+        node_count="$(k3s kubectl --kubeconfig=/root/.kube/config get nodes --no-headers | wc -l | tr -d ' ')"
+        expected_mode="{{ cilium_expected_encryption_mode | default('Wireguard') }}"
+        min_peers=0
+        if [ "${node_count}" -gt 1 ]; then
+          min_peers=$((node_count - 1))
+        fi
+
+        failed=0
+        for pod in ${pods}; do
+          status="$(k3s kubectl --kubeconfig=/root/.kube/config exec -n kube-system "${pod}" -- cilium-dbg status)"
+          enc_mode="$(printf '%s\n' "${status}" | awk '/^Encryption:/{print $2; exit}')"
+          peers="$(printf '%s\n' "${status}" | sed -n 's/.*Peers: \([0-9][0-9]*\).*/\1/p' | head -n1)"
+          health_ratio="$(printf '%s\n' "${status}" | awk '/^Cluster health:/{print $3; exit}')"
+          echo "pod=${pod} encryption=${enc_mode:-unknown} peers=${peers:-n/a} cluster_health=${health_ratio:-unknown}"
+
+          if [ -n "${expected_mode}" ] && [ "${enc_mode}" != "${expected_mode}" ]; then
+            echo "ERROR: ${pod} encryption mode ${enc_mode:-missing} != ${expected_mode}"
+            failed=1
+          fi
+
+          if [ "${min_peers}" -gt 0 ] && [ -n "${peers}" ] && [ "${peers}" -lt "${min_peers}" ]; then
+            echo "ERROR: ${pod} has ${peers} wireguard peers, expected at least ${min_peers}"
+            failed=1
+          fi
+
+          if [ -z "${health_ratio}" ]; then
+            echo "ERROR: ${pod} missing Cluster health output"
+            failed=1
+          else
+            healthy="${health_ratio%/*}"
+            total="${health_ratio#*/}"
+            if [ "${healthy}" != "${total}" ]; then
+              echo "ERROR: ${pod} cluster health degraded (${health_ratio} reachable)"
+              failed=1
+            fi
+          fi
+        done
+
+        exit "${failed}"
+      args:
+        executable: /bin/bash
+      register: cilium_convergence_after_restart
+      retries: "{{ cilium_convergence_retries | default(8) }}"
+      delay: "{{ cilium_convergence_retry_delay | default(20) }}"
+      until: cilium_convergence_after_restart.rc == 0
+      failed_when: false
+      changed_when: false
+      when:
+        - cilium_convergence_check.rc != 0
+        - cilium_auto_restart_on_convergence_failure | default(true)
+
+    - name: Fail when Cilium convergence checks do not pass
+      fail:
+        msg: |
+          Cilium node-to-node convergence check failed.
+          Initial check output:
+          {{ (cilium_convergence_check.stdout | default('')) | trim }}
+          {% if cilium_convergence_after_restart is defined %}
+          After restart output:
+          {{ (cilium_convergence_after_restart.stdout | default('')) | trim }}
+          {% endif %}
+      when: >
+        ((cilium_convergence_check.rc | default(1)) != 0 and not (cilium_auto_restart_on_convergence_failure | default(true))) or
+        (
+          (cilium_convergence_check.rc | default(0)) != 0 and
+          (cilium_auto_restart_on_convergence_failure | default(true)) and
+          ((cilium_convergence_after_restart.rc | default(1)) != 0)
+        )
+
+  rescue:
+    - name: "[Cilium failure] Capture cilium status --verbose"
+      command: cilium status --verbose
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cilium_status_verbose
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[Cilium failure] Display cilium status --verbose"
+      debug:
+        msg: "{{ cilium_status_verbose.stdout_lines | default(['(cilium status not available)']) }}"
+
+    - name: "[Cilium failure] List Cilium and operator pods"
+      command: k3s kubectl get pods -n kube-system -l k8s-app=cilium -o wide
+      register: cilium_pods
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[Cilium failure] Display Cilium pods"
+      debug:
+        msg: "{{ cilium_pods.stdout_lines | default([]) }}"
+
+    - name: "[Cilium failure] Logs from Cilium agent (first pod)"
+      shell: >
+        k3s kubectl logs -n kube-system -l k8s-app=cilium --tail=80 --prefix=true 2>&1 || true
+      register: cilium_agent_logs
+      changed_when: false
+
+    - name: "[Cilium failure] Display Cilium agent logs (last 80 lines)"
+      debug:
+        msg: "{{ cilium_agent_logs.stdout_lines | default([]) }}"
+
+    - name: "[Cilium failure] Logs from Cilium operator"
+      shell: >
+        k3s kubectl logs -n kube-system -l io.cilium/app=operator --tail=80 --prefix=true 2>&1 || true
+      register: cilium_operator_logs
+      changed_when: false
+
+    - name: "[Cilium failure] Display Cilium operator logs (last 80 lines)"
+      debug:
+        msg: "{{ cilium_operator_logs.stdout_lines | default([]) }}"
+
+    - name: "[Cilium failure] Recent events in kube-system"
+      shell: k3s kubectl get events -n kube-system --sort-by='.lastTimestamp' --field-selector type!=Normal 2>/dev/null | tail -50
+      register: kube_events
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[Cilium failure] Display recent non-Normal events"
+      debug:
+        msg: "{{ kube_events.stdout_lines | default([]) }}"
+
+    - name: "[Cilium failure] Re-raise so playbook fails"
+      fail:
+        msg: >
+          Cilium install failed. See [Cilium failure] output above.
+          On primary master run: KUBECONFIG=/root/.kube/config cilium status --verbose
+          and: k3s kubectl get pods -n kube-system -l k8s-app=cilium; k3s kubectl logs -n kube-system -l k8s-app=cilium --tail=200
+
+# Hubble relay: default internalTrafficPolicy Local breaks pod→local-node:4244 with Cilium KPR. Use Cluster so relay can reach peer via tunnel.
+- name: Set hubble-peer Service internalTrafficPolicy to Cluster (so hubble-relay can reach peers)
+  command: >
+    k3s kubectl --kubeconfig=/root/.kube/config patch svc hubble-peer -n kube-system
+    -p '{"spec":{"internalTrafficPolicy":"Cluster"}}'
+    --type=merge
+  when: enable_cilium | default(true)
+  register: hubble_peer_patch
+  failed_when: false
+  changed_when: hubble_peer_patch.rc == 0

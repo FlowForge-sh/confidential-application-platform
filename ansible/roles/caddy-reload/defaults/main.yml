@@ -1,0 +1,7 @@
+---
+# Re-render Caddy ConfigMap from base routes + tenant ConfigMaps (label caddy-route=true) and restart Caddy.
+# Requires Caddy already deployed (apply-caddy). Uses same template as caddy role; keep configmap.yaml.j2 in sync.
+caddy_namespace: caddy
+# Built from cluster ConfigMaps by this role; override only for testing.
+caddy_tenant_handles_per_zone: {}
+caddy_tenant_hosts_per_zone: {}

@@ -1,0 +1,145 @@
+---
+# Kata Containers Deployment using Official Helm Chart
+# This role deploys standard Kata (non-TEE) for VM-level isolation
+# For TEE support (AMD SEV-SNP/Intel TDX), use the CoCo role instead
+
+- name: Verify KVM support
+  shell: grep -E 'vmx|svm' /proc/cpuinfo
+  register: kvm_check
+  failed_when: false
+  changed_when: false
+
+- name: Display KVM check result
+  debug:
+    msg: "KVM support: {{ 'Available' if kvm_check.rc == 0 else 'Not available' }}"
+
+- name: Check if Helm 4 is installed
+  command: helm version --short
+  register: helm_version
+  changed_when: false
+  failed_when: false
+
+- name: Install Helm 4 if not present
+  shell: |
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4.sh | bash
+  args:
+    creates: /usr/local/bin/helm
+  when: helm_version.rc != 0 or "v4." not in helm_version.stdout
+
+- name: Get latest Kata version from GitHub API
+  uri:
+    url: https://api.github.com/repos/kata-containers/kata-containers/releases/latest
+    return_content: yes
+  register: kata_latest_release
+  delegate_to: localhost
+  run_once: true
+  when: kata_chart_version == "latest"
+
+- name: Set Kata deploy version (resolved chart version)
+  set_fact:
+    kata_deploy_version: "{{ kata_latest_release.json.tag_name if kata_chart_version == 'latest' else kata_chart_version }}"
+
+- name: Create Kata namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: kube-system
+  environment:
+    KUBECONFIG: /root/.kube/config
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Create Kata config directory
+  file:
+    path: /etc/kata-containers
+    state: directory
+    mode: '0755'
+
+- name: Copy Kata Helm values
+  copy:
+    src: values.yaml
+    dest: /etc/kata-containers/values.yaml
+    mode: '0644'
+
+- name: Deploy Kata Containers using Helm
+  kubernetes.core.helm:
+    name: kata-deploy
+    chart_ref: oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy
+    chart_version: "{{ kata_deploy_version }}"
+    release_namespace: kube-system
+    values_files:
+      - /etc/kata-containers/values.yaml
+    wait: true
+    wait_timeout: 10m
+  environment:
+    KUBECONFIG: /root/.kube/config
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Wait for kata-deploy DaemonSet to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: DaemonSet
+    name: kata-deploy
+    namespace: kube-system
+  register: kata_daemonset
+  until: >
+    kata_daemonset.resources | length > 0 and
+    kata_daemonset.resources[0].status.numberReady | default(0) > 0
+  retries: 30
+  delay: 10
+  environment:
+    KUBECONFIG: /root/.kube/config
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Create RuntimeClass for kata-qemu
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: node.k8s.io/v1
+      kind: RuntimeClass
+      metadata:
+        name: kata-qemu
+      handler: kata-qemu
+      scheduling:
+        nodeSelector:
+          katacontainers.io/kata-runtime: "true"
+  environment:
+    KUBECONFIG: /root/.kube/config
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Create Kata installation summary
+  copy:
+    dest: /etc/kata-containers/README.txt
+    content: |
+      Kata Containers v{{ kata_chart_version }}
+      Deployed via Helm Chart (Official)
+      
+      KVM Support: {{ 'Available' if kvm_check.rc == 0 else 'Not available' }}
+      
+      Available RuntimeClasses:
+      - kata-qemu    (Standard QEMU VM isolation)
+      
+      Usage:
+        kubectl apply -f pod.yaml
+      
+      Where pod.yaml contains:
+        spec:
+          runtimeClassName: kata-qemu
+      
+      Verify installation:
+        kubectl get runtimeclass
+        kubectl get pods -n kube-system -l name=kata-deploy
+        kubectl logs -n kube-system -l name=kata-deploy
+      
+      For TEE support (AMD SEV-SNP/Intel TDX):
+        Use the CoCo role instead (enable_confidential_containers=true)
+      
+      Documentation:
+        https://github.com/kata-containers/kata-containers
+    mode: '0644'
