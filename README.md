@@ -7,7 +7,7 @@ List of supported hardware for testing - [SUPPORTED HARDWARE](./SUPPORTED_HARDWA
 
 
 # Resources 
-https://github.com/confidential-containers/confidential-containers/blob/main/quickstart.md
-https://confidentialcontainers.org/docs/architecture/design-overview/
-https://confidentialcontainers.org/docs/architecture/trust-model/trust-model/
-https://github.com/kata-containers/kata-containers/blob/main/docs/install/container-manager/containerd/containerd-install.md
+- https://github.com/confidential-containers/confidential-containers/blob/main/quickstart.md
+- https://confidentialcontainers.org/docs/architecture/design-overview/
+- https://confidentialcontainers.org/docs/architecture/trust-model/trust-model/
+- https://github.com/kata-containers/kata-containers/blob/main/docs/install/container-manager/containerd/containerd-install.md
