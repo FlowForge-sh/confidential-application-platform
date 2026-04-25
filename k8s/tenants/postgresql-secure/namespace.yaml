@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: tenant-base
+  name: postgresql-demo
   labels:
-    tenant: tenant-base
-    tenant-id: "000"
+    tenant: postgresql-demo
+    tenant-id: "001"
     isolation: strict
     managed-by: kustomize
     pod-security.kubernetes.io/enforce: baseline

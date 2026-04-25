@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: tenant-base
+  name: redis-demo
   labels:
-    tenant: tenant-base
-    tenant-id: "000"
+    tenant: redis-demo
+    tenant-id: "002"
     isolation: strict
     managed-by: kustomize
     pod-security.kubernetes.io/enforce: baseline

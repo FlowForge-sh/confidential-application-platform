@@ -1,17 +1,16 @@
-# Tenant isolation: ingress from same namespace only; egress to DNS and same namespace.
-# KBS and world 80/443 are added by tenant-contract component.
+# Tenant isolation: ingress from same namespace only; egress to DNS, same namespace, and KBS.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
   name: tenant-isolation
-  namespace: tenant-base
+  namespace: postgresql-demo
 spec:
   description: "Strict network isolation for multi-tenant security"
   endpointSelector: {}
   ingress:
     - fromEndpoints:
         - matchLabels:
-            io.kubernetes.pod.namespace: tenant-base
+            io.kubernetes.pod.namespace: postgresql-demo
   egress:
     - toEndpoints:
         - matchLabels:
@@ -25,4 +24,17 @@ spec:
               protocol: TCP
     - toEndpoints:
         - matchLabels:
-            io.kubernetes.pod.namespace: tenant-base
+            io.kubernetes.pod.namespace: postgresql-demo
+    - toServices:
+        - k8sService:
+            namespace: trustee-operator-system
+            serviceName: kbs-service
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - path: "^/kbs/v0/auth$"
+              - path: "^/kbs/v0/attest$"
+              - path: "^/kbs/v0/resource/default/postgresql-demo-storage/workload-secret-seed$"
