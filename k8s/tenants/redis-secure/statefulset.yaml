@@ -24,6 +24,7 @@ spec:
         storage.flowforge.sh/secure-pv-init-data-sha256: "cd3438a42fcfae5a8af41052e62df1578823e78b57110f44371f96747b7ce9b5"
     spec:
       runtimeClassName: kata-qemu-snp
+      serviceAccountName: redis-workload
       imagePullSecrets:
         - name: ghcr-pull-secret
       nodeSelector:

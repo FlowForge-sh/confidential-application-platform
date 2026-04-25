@@ -46,8 +46,8 @@ patches:
                     protocol: TCP
                 rules:
                   http:
-                    - path: "^/kbs/v0/auth.*$"
-                    - path: "^/kbs/v0/attest.*$"
+                    - path: "^/kbs/v0/auth$"
+                    - path: "^/kbs/v0/attest$"
                     - path: "^/kbs/v0/resource/default/kbsres1/key1.*$"
           - toEntities:
               - world
